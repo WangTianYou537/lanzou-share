@@ -6,12 +6,13 @@ rust-version = "1.70"
 description = "Lanzou (蓝奏云) public/password share link resolver with acw_sc__v2 and CDN risk bypass"
 license = "MIT"
 readme = "README.md"
-repository = "https://github.com/WangTianYou537/rLanz"
-homepage = "https://github.com/WangTianYou537/rLanz"
-documentation = "https://docs.rs/rLanz"
+repository = "https://github.com/WangTianYou537/lanzou-share"
+homepage = "https://github.com/WangTianYou537/lanzou-share"
+documentation = "https://docs.rs/lanzou-share"
 keywords = ["lanzou", "download", "share", "cloud"]
 categories = ["network-programming", "web-programming::http-client"]
-exclude = ["target/"]
+exclude = ["target/", ".git/"]
+authors = ["WangTianYou537"]
 
 [dependencies]
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "cookies", "gzip", "json", "rustls-tls"] }
@@ -33,5 +34,5 @@ path = "src/bin/lanzou.rs"
 required-features = ["cli"]
 
 [lib]
-name = "rLanz"
+name = "lanzou_share"
 path = "src/lib.rs"

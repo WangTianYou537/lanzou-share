@@ -2,6 +2,8 @@
 
 Lanzou (蓝奏云) share-link resolver library and CLI for Rust.
 
+Repository: <https://github.com/WangTianYou537/lanzou-share>
+
 Supports:
 
 - public shares and password-protected shares
@@ -27,12 +29,16 @@ lanzou-share = { version = "0.1", default-features = false }
 use lanzou_share::{Client, ParseOptions};
 
 fn main() -> lanzou_share::Result<()> {
-    let client = Client::new()?;
+    let mut client = Client::new()?;
     let r = client.parse(
         "https://hya.lanzouu.com/iUTg43ww9ich",
         ParseOptions::default(),
     )?;
-    println!("{} -> {}", r.filename.as_deref().unwrap_or("?"), r.direct.as_deref().unwrap_or(&r.telecom));
+    println!(
+        "{} -> {}",
+        r.filename.as_deref().unwrap_or("?"),
+        r.direct.as_deref().unwrap_or(&r.telecom)
+    );
     Ok(())
 }
 ```
