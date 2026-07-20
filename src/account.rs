@@ -234,13 +234,16 @@ impl Account {
                 })
                 .unwrap_or(false);
             if !(zt_ok || info_ok) {
-                if raw.contains("验证") || raw.contains("captcha") || raw.contains("token") {
-                    last_err = Error::Parse(format!(
-                        "login requires captcha; use cookie login: lanzou login --cookie-str 'PHPSESSID=...; ylogin=...'  body={raw}"
-                    ));
-                } else {
-                    last_err = Error::Parse(format!("login failed via {post_url}: {raw}"));
+                // mlogin JSON is definitive
+                if raw.contains(""zt"") || raw.contains("info") {
+                    if raw.contains("验证") || raw.contains("captcha") || raw.contains("token") {
+                        return Err(Error::Parse(format!(
+                            "login requires captcha; use: lanzou login --cookie-str 'PHPSESSID=...; ylogin=...'  body={raw}"
+                        )));
+                    }
+                    return Err(Error::Parse(format!("login failed: {raw}")));
                 }
+                last_err = Error::Parse(format!("login failed via {post_url}: {raw}"));
                 continue;
             }
             if self.cookie.is_empty() {
