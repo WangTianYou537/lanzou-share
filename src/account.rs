@@ -14,9 +14,11 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-const DEFAULT_ACCOUNT_BASE: &str = "https://up.woozooo.com/";
+const DEFAULT_ACCOUNT_BASE: &str = "https://pc.woozooo.com/";
 const DEFAULT_UA: &str =
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
+const MOBILE_UA: &str =
+    "Mozilla/5.0 (Linux; Android 5.0; SM-G900P Build/LRX21T) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/82.0.4051.0 Mobile Safari/537.36";
 
 /// Entry type: folder or file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -143,51 +145,138 @@ impl Account {
         self.cookie = parts.join("; ");
     }
 
-    /// Login and persist cookie if cookie file is set.
+    /// Login via account.php formhash + mydisk.php (current web flow).
     pub fn login(&mut self) -> Result<()> {
-        let resp = self
+        // 1) GET account.php
+        let resp1 = self
             .http
-            .post(format!("{}mlogin.php", self.base))
-            .header(CONTENT_TYPE, "application/x-www-form-urlencoded")
-            .form(&[
-                ("task", "3"),
-                ("uid", self.username.as_str()),
-                ("pwd", self.password.as_str()),
-            ])
+            .get(format!("{}mlogin.php", self.base))
+            .header(USER_AGENT, DEFAULT_UA)
+            .header(reqwest::header::ACCEPT_LANGUAGE, "zh-CN,zh;q=0.9")
+            .header(reqwest::header::REFERER, format!("{}mydisk.php", self.base))
             .send()?;
-        self.store_set_cookie(resp.headers());
-        let status = resp.status();
-        let raw = resp.text()?;
-        if !status.is_success() {
-            return Err(Error::Http(format!("login status {status} body={raw}")));
+        self.store_set_cookie(resp1.headers());
+        let html1 = resp1.text()?;
+        let mut formhash = extract_formhash(&html1);
+        if formhash.is_empty() {
+            if let Ok(resp_m) = self
+                .http
+                .get(format!("{}mlogin.php", self.base))
+                .header(USER_AGENT, MOBILE_UA)
+                .send()
+            {
+                self.store_set_cookie(resp_m.headers());
+                if let Ok(h) = resp_m.text() {
+                    formhash = extract_formhash(&h);
+                }
+            }
         }
-        let v: Value = serde_json::from_str(&raw)
-            .map_err(|e| Error::Parse(format!("login non-json: {e}; {raw}")))?;
-        if json_str(&v["zt"]) != "1" {
-            return Err(Error::Parse(format!("login failed: {raw}")));
+
+        let mut form = vec![
+            ("task", "3".to_string()),
+            ("setSessionId", String::new()),
+            ("setToken", String::new()),
+            ("setSig", String::new()),
+            ("setScene", String::new()),
+            ("uid", self.username.clone()),
+            ("pwd", self.password.clone()),
+        ];
+        if !formhash.is_empty() {
+            form.push(("formhash", formhash));
         }
-        if self.cookie.is_empty() {
-            return Err(Error::Parse("login ok but empty cookie".into()));
+
+        let try_urls = [
+            format!("{}mlogin.php?istoken=3", self.base),
+            format!("{}mlogin.php", self.base),
+            format!("{}mydisk.php", self.base),
+        ];
+        let mut last_err = Error::Parse("login failed".into());
+        for post_url in try_urls {
+            let form_refs: Vec<(&str, &str)> = form.iter().map(|(k, v)| (*k, v.as_str())).collect();
+            let mut req = self
+                .http
+                .post(&post_url)
+                .header(CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .header(USER_AGENT, MOBILE_UA)
+                .header(reqwest::header::ACCEPT_LANGUAGE, "zh-CN,zh;q=0.9")
+                .header(reqwest::header::REFERER, format!("{}account.php", self.base))
+                .form(&form_refs);
+            if !self.cookie.is_empty() {
+                req = req.header(COOKIE, &self.cookie);
+            }
+            let resp = match req.send() {
+                Ok(r) => r,
+                Err(e) => {
+                    last_err = Error::Request(e);
+                    continue;
+                }
+            };
+            self.store_set_cookie(resp.headers());
+            let status = resp.status();
+            let raw = match resp.text() {
+                Ok(t) => t,
+                Err(e) => {
+                    last_err = Error::Request(e);
+                    continue;
+                }
+            };
+            if !status.is_success() {
+                last_err = Error::Http(format!("login status {status} body={raw}"));
+                continue;
+            }
+            let info_ok = raw.contains("成功");
+            let zt_ok = serde_json::from_str::<Value>(&raw)
+                .ok()
+                .map(|v| {
+                    let zt = json_str(&v["zt"]);
+                    let info = json_str(&v["info"]);
+                    zt == "1" || info.contains("成功")
+                })
+                .unwrap_or(false);
+            if !(zt_ok || info_ok) {
+                if raw.contains("验证") || raw.contains("captcha") || raw.contains("token") {
+                    last_err = Error::Parse(format!(
+                        "login requires captcha; use cookie login: lanzou login --cookie-str 'PHPSESSID=...; ylogin=...'  body={raw}"
+                    ));
+                } else {
+                    last_err = Error::Parse(format!("login failed via {post_url}: {raw}"));
+                }
+                continue;
+            }
+            if self.cookie.is_empty() {
+                last_err = Error::Parse("login ok but empty cookie".into());
+                continue;
+            }
+            if !self.verification() {
+                last_err = Error::Parse(format!(
+                    "login cookie not accepted by verification; body={raw}"
+                ));
+                continue;
+            }
+            if let Some(p) = &self.cookie_file {
+                fs::write(p, &self.cookie)?;
+            }
+            return Ok(());
         }
-        if let Some(p) = &self.cookie_file {
-            fs::write(p, &self.cookie)?;
-        }
-        Ok(())
+        Err(last_err)
     }
 
     /// True when session cookie is still valid.
+
     pub fn verification(&self) -> bool {
         if self.cookie.is_empty() {
             return false;
         }
-        match self.post_task("task=5&folder_id=-1") {
-            Ok(raw) => {
-                if let Ok(v) = serde_json::from_str::<Value>(&raw) {
-                    json_str(&v["zt"]) != "9"
-                } else {
-                    false
+        if let Ok(raw) = self.post_task("task=5&folder_id=-1") {
+            if let Ok(v) = serde_json::from_str::<Value>(&raw) {
+                let zt = json_str(&v["zt"]);
+                if !zt.is_empty() && zt != "9" {
+                    return true;
                 }
             }
+        }
+        match self.get_html("account.php") {
+            Ok(html) => !html.contains("网盘用户登录"),
             Err(_) => false,
         }
     }
@@ -586,4 +675,21 @@ fn str_intercept(s: &str, start: &str, end: &str) -> String {
         return String::new();
     };
     s[i..i + j].to_string()
+}
+
+
+fn extract_formhash(html: &str) -> String {
+    let re = Regex::new(r#"name=["']formhash["']\s+value=["']([^"']+)["']"#).unwrap();
+    if let Some(c) = re.captures(html) {
+        return c[1].to_string();
+    }
+    let re2 = Regex::new(r#"value=["']([^"']+)["']\s+name=["']formhash["']"#).unwrap();
+    if let Some(c) = re2.captures(html) {
+        return c[1].to_string();
+    }
+    let re3 = Regex::new(r#"formhash['"]?\s*[:=]\s*['"]([^'"]+)['"]"#).unwrap();
+    if let Some(c) = re3.captures(html) {
+        return c[1].to_string();
+    }
+    "03e22cb9".into()
 }

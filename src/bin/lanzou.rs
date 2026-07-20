@@ -48,9 +48,11 @@ enum Commands {
     /// Login and save cookie
     Login {
         #[arg(short = 'u', long = "user", env = "LANZOU_USER")]
-        user: String,
+        user: Option<String>,
         #[arg(long = "pass", env = "LANZOU_PASS")]
-        pass: String,
+        pass: Option<String>,
+        #[arg(long = "cookie-str")]
+        cookie_str: Option<String>,
         #[arg(short = 'c', long = "cookie", default_value = "./lanzou.cookie", env = "LANZOU_COOKIE")]
         cookie: PathBuf,
     },
@@ -168,7 +170,7 @@ fn main() -> ExitCode {
             filename,
             no_resolve,
         }) => cmd_parse(url, password, down, output_dir, filename, no_resolve),
-        Some(Commands::Login { user, pass, cookie }) => cmd_login(user, pass, cookie),
+        Some(Commands::Login { user, pass, cookie_str, cookie }) => cmd_login(user, pass, cookie_str, cookie),
         Some(Commands::Logout { cookie }) => {
             let _ = std::fs::remove_file(&cookie);
             println!("[ok] cookie removed: {}", cookie.display());
@@ -311,7 +313,38 @@ fn cmd_parse(
     ExitCode::SUCCESS
 }
 
-fn cmd_login(user: String, pass: String, cookie: PathBuf) -> ExitCode {
+fn cmd_login(
+    user: Option<String>,
+    pass: Option<String>,
+    cookie_str: Option<String>,
+    cookie: PathBuf,
+) -> ExitCode {
+    if let Some(cs) = cookie_str {
+        let mut acc = match Account::new("", "") {
+            Ok(a) => a.with_cookie_file(&cookie),
+            Err(e) => {
+                eprintln!("[error] {e}");
+                return ExitCode::from(1);
+            }
+        };
+        if let Err(e) = acc.set_cookie(cs) {
+            eprintln!("[error] {e}");
+            return ExitCode::from(1);
+        }
+        if !acc.verification() {
+            eprintln!("[error] cookie invalid or expired (verification failed)");
+            return ExitCode::from(1);
+        }
+        println!("[ok] cookie imported and verified, saved to {}", cookie.display());
+        return ExitCode::SUCCESS;
+    }
+    let user = user.unwrap_or_default();
+    let pass = pass.unwrap_or_default();
+    if user.is_empty() || pass.is_empty() {
+        eprintln!("usage: lanzou login --user U --pass P");
+        eprintln!("   or: lanzou login --cookie-str 'PHPSESSID=...; ylogin=...'");
+        return ExitCode::from(1);
+    }
     let mut acc = match Account::new(user, pass) {
         Ok(a) => a.with_cookie_file(&cookie),
         Err(e) => {
@@ -321,6 +354,8 @@ fn cmd_login(user: String, pass: String, cookie: PathBuf) -> ExitCode {
     };
     if let Err(e) = acc.login() {
         eprintln!("[error] {e}");
+        eprintln!("tip: if captcha is required, login in browser then:");
+        eprintln!("  lanzou login --cookie-str 'PHPSESSID=...; ylogin=...'");
         return ExitCode::from(1);
     }
     println!("[ok] logged in, cookie saved to {}", cookie.display());
