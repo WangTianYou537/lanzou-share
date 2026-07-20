@@ -2,7 +2,6 @@
 //! Ported from `lanzou.class.php`. Credentials are never hard-coded.
 
 use crate::error::{Error, Result};
-use regex::Regex;
 use reqwest::blocking::multipart::{Form, Part};
 use reqwest::blocking::Client as HttpClient;
 use reqwest::header::{HeaderMap, HeaderValue, CONTENT_TYPE, COOKIE, SET_COOKIE, USER_AGENT};
