@@ -235,7 +235,7 @@ impl Account {
                 .unwrap_or(false);
             if !(zt_ok || info_ok) {
                 // mlogin JSON is definitive
-                if raw.contains(""zt"") || raw.contains("info") {
+                if raw.contains("\"zt\"") || raw.contains("info") {
                     if raw.contains("验证") || raw.contains("captcha") || raw.contains("token") {
                         return Err(Error::Parse(format!(
                             "login requires captcha; use: lanzou login --cookie-str 'PHPSESSID=...; ylogin=...'  body={raw}"
