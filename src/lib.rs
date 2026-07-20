@@ -7,7 +7,7 @@ mod account;
 mod acw;
 mod error;
 
-pub use account::{Account, EntryKind, FileInfo, FolderInfo, ListEntry};
+pub use account::{Account, EntryKind, FileInfo, FolderInfo, ListEntry, UploadResult};
 pub use acw::{calc_acw_sc_v2, extract_arg1, is_acw_challenge, solve_from_html, MASK, PERM};
 pub use error::{Error, Result};
 

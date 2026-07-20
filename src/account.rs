@@ -3,11 +3,14 @@
 
 use crate::error::{Error, Result};
 use regex::Regex;
+use reqwest::blocking::multipart::{Form, Part};
 use reqwest::blocking::Client as HttpClient;
 use reqwest::header::{HeaderMap, HeaderValue, CONTENT_TYPE, COOKIE, SET_COOKIE, USER_AGENT};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::fs;
+use std::fs::File;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -440,6 +443,119 @@ impl Account {
     pub fn delete_file(&self, file_id: &str) -> Result<String> {
         self.post_task(&format!("task=6&file_id={file_id}"))
     }
+
+    /// Upload a local file via `fileup.php` (task=1 multipart).
+    /// Protocol aligned with common Lanzou web clients.
+    pub fn upload(&self, local_path: impl AsRef<Path>, folder_id: &str) -> Result<UploadResult> {
+        let local_path = local_path.as_ref();
+        let folder_id = if folder_id.is_empty() { "-1" } else { folder_id };
+        if !local_path.is_file() {
+            return Err(Error::Parse(format!("not a file: {}", local_path.display())));
+        }
+        let filename = local_path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .ok_or_else(|| Error::Parse("invalid filename".into()))?
+            .to_string();
+
+        let mut urls = vec![format!("{}fileup.php", self.base)];
+        if self.base.contains("up.woozooo.com") {
+            urls.push("https://pc.woozooo.com/fileup.php".into());
+        } else if self.base.contains("pc.woozooo.com") {
+            urls.push("https://up.woozooo.com/fileup.php".into());
+        }
+
+        let mut last_err = Error::Http("upload failed".into());
+        for up_url in urls {
+            let mut file = File::open(local_path)?;
+            let mut buf = Vec::new();
+            file.read_to_end(&mut buf)?;
+            let part = Part::bytes(buf)
+                .file_name(filename.clone())
+                .mime_str("application/octet-stream")
+                .map_err(|e| Error::Http(e.to_string()))?;
+            let form = Form::new()
+                .text("task", "1")
+                .text("vie", "2")
+                .text("ve", "2")
+                .text("id", "WU_FILE_0")
+                .text("folder_id_bb_n", folder_id.to_string())
+                .text("name", filename.clone())
+                .part("upload_file", part);
+
+            let mut req = self
+                .http
+                .post(&up_url)
+                .timeout(Duration::from_secs(3600))
+                .header(USER_AGENT, DEFAULT_UA)
+                .header(reqwest::header::ACCEPT_LANGUAGE, "zh-CN,zh;q=0.9,en;q=0.8")
+                .header(reqwest::header::REFERER, &self.base)
+                .multipart(form);
+            if !self.cookie.is_empty() {
+                req = req.header(COOKIE, &self.cookie);
+            }
+            let resp = match req.send() {
+                Ok(r) => r,
+                Err(e) => {
+                    last_err = Error::Request(e);
+                    continue;
+                }
+            };
+            let status = resp.status();
+            let raw = match resp.text() {
+                Ok(t) => t,
+                Err(e) => {
+                    last_err = Error::Request(e);
+                    continue;
+                }
+            };
+            if !status.is_success() {
+                last_err = Error::Http(format!("upload {status}: {}", &raw[..raw.len().min(300)]));
+                continue;
+            }
+            let v: Value = match serde_json::from_str(&raw) {
+                Ok(v) => v,
+                Err(e) => {
+                    last_err = Error::Parse(format!("upload non-json: {e}; {raw}"));
+                    continue;
+                }
+            };
+            if json_str(&v["zt"]) != "1" {
+                last_err = Error::Parse(format!("upload failed: {raw}"));
+                continue;
+            }
+            let mut file_id = String::new();
+            let mut name = filename.clone();
+            if let Some(arr) = v.get("text").and_then(|t| t.as_array()) {
+                if let Some(row) = arr.first() {
+                    file_id = json_str(&row["id"]);
+                    let n = json_str(&row["name"]);
+                    let n2 = json_str(&row["name_all"]);
+                    if !n.is_empty() {
+                        name = n;
+                    } else if !n2.is_empty() {
+                        name = n2;
+                    }
+                }
+            }
+            return Ok(UploadResult {
+                file_id,
+                name,
+                folder_id: folder_id.to_string(),
+                raw_json: raw,
+            });
+        }
+        Err(last_err)
+    }
+}
+
+/// Result of a successful upload.
+#[derive(Debug, Clone)]
+pub struct UploadResult {
+    pub file_id: String,
+    pub name: String,
+    pub folder_id: String,
+    pub raw_json: String,
 }
 
 fn json_str(v: &Value) -> String {
