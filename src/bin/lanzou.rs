@@ -1,5 +1,5 @@
 use clap::Parser;
-use lanzou_share::{Client, Error, ParseOptions};
+use rLan::{Client, Error, ParseOptions};
 use std::process::ExitCode;
 
 #[derive(Parser, Debug)]
