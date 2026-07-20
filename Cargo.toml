@@ -1,6 +1,6 @@
 [package]
 name = "lanzou-share"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 rust-version = "1.70"
 description = "Lanzou (蓝奏云) public/password share link resolver with acw_sc__v2 and CDN risk bypass"
