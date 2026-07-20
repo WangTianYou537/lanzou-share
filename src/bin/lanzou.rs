@@ -1,5 +1,5 @@
 use clap::Parser;
-use rLan::{Client, Error, ParseOptions};
+use rLanz::{Client, Error, ParseOptions};
 use std::process::ExitCode;
 
 #[derive(Parser, Debug)]
