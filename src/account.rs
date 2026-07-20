@@ -17,8 +17,6 @@ use std::time::Duration;
 const DEFAULT_ACCOUNT_BASE: &str = "https://pc.woozooo.com/";
 const DEFAULT_UA: &str =
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
-const MOBILE_UA: &str =
-    "Mozilla/5.0 (Linux; Android 5.0; SM-G900P Build/LRX21T) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/82.0.4051.0 Mobile Safari/537.36";
 
 /// Entry type: folder or file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -145,124 +143,43 @@ impl Account {
         self.cookie = parts.join("; ");
     }
 
-    /// Login via account.php formhash + mydisk.php (current web flow).
+    /// Login with simple POST to mlogin.php (task/uid/pwd).
     pub fn login(&mut self) -> Result<()> {
-        // 1) GET account.php
-        let resp1 = self
+        let resp = self
             .http
-            .get(format!("{}mlogin.php", self.base))
+            .post(format!("{}mlogin.php", self.base))
+            .header(CONTENT_TYPE, "application/x-www-form-urlencoded")
             .header(USER_AGENT, DEFAULT_UA)
             .header(reqwest::header::ACCEPT_LANGUAGE, "zh-CN,zh;q=0.9")
-            .header(reqwest::header::REFERER, format!("{}mydisk.php", self.base))
+            .header(reqwest::header::REFERER, format!("{}mlogin.php", self.base))
+            .form(&[
+                ("task", "3"),
+                ("uid", self.username.as_str()),
+                ("pwd", self.password.as_str()),
+            ])
             .send()?;
-        self.store_set_cookie(resp1.headers());
-        let html1 = resp1.text()?;
-        let mut formhash = extract_formhash(&html1);
-        if formhash.is_empty() {
-            if let Ok(resp_m) = self
-                .http
-                .get(format!("{}mlogin.php", self.base))
-                .header(USER_AGENT, MOBILE_UA)
-                .send()
-            {
-                self.store_set_cookie(resp_m.headers());
-                if let Ok(h) = resp_m.text() {
-                    formhash = extract_formhash(&h);
-                }
-            }
+        self.store_set_cookie(resp.headers());
+        let status = resp.status();
+        let raw = resp.text()?;
+        if !status.is_success() {
+            return Err(Error::Http(format!("login status {status} body={raw}")));
         }
-
-        let mut form = vec![
-            ("task", "3".to_string()),
-            ("setSessionId", String::new()),
-            ("setToken", String::new()),
-            ("setSig", String::new()),
-            ("setScene", String::new()),
-            ("uid", self.username.clone()),
-            ("pwd", self.password.clone()),
-        ];
-        if !formhash.is_empty() {
-            form.push(("formhash", formhash));
+        let v: Value = serde_json::from_str(&raw)
+            .map_err(|e| Error::Parse(format!("login non-json: {e}; {raw}")))?;
+        if json_str(&v["zt"]) != "1" {
+            let info = json_str(&v["info"]);
+            let msg = if info.is_empty() { raw } else { info };
+            return Err(Error::Parse(format!("login failed: {msg}")));
         }
-
-        let try_urls = [
-            format!("{}mlogin.php?istoken=3", self.base),
-            format!("{}mlogin.php", self.base),
-            format!("{}mydisk.php", self.base),
-        ];
-        let mut last_err = Error::Parse("login failed".into());
-        for post_url in try_urls {
-            let form_refs: Vec<(&str, &str)> = form.iter().map(|(k, v)| (*k, v.as_str())).collect();
-            let mut req = self
-                .http
-                .post(&post_url)
-                .header(CONTENT_TYPE, "application/x-www-form-urlencoded")
-                .header(USER_AGENT, MOBILE_UA)
-                .header(reqwest::header::ACCEPT_LANGUAGE, "zh-CN,zh;q=0.9")
-                .header(reqwest::header::REFERER, format!("{}account.php", self.base))
-                .form(&form_refs);
-            if !self.cookie.is_empty() {
-                req = req.header(COOKIE, &self.cookie);
-            }
-            let resp = match req.send() {
-                Ok(r) => r,
-                Err(e) => {
-                    last_err = Error::Request(e);
-                    continue;
-                }
-            };
-            self.store_set_cookie(resp.headers());
-            let status = resp.status();
-            let raw = match resp.text() {
-                Ok(t) => t,
-                Err(e) => {
-                    last_err = Error::Request(e);
-                    continue;
-                }
-            };
-            if !status.is_success() {
-                last_err = Error::Http(format!("login status {status} body={raw}"));
-                continue;
-            }
-            let info_ok = raw.contains("成功");
-            let zt_ok = serde_json::from_str::<Value>(&raw)
-                .ok()
-                .map(|v| {
-                    let zt = json_str(&v["zt"]);
-                    let info = json_str(&v["info"]);
-                    zt == "1" || info.contains("成功")
-                })
-                .unwrap_or(false);
-            if !(zt_ok || info_ok) {
-                // mlogin JSON is definitive
-                if raw.contains("\"zt\"") || raw.contains("info") {
-                    if raw.contains("验证") || raw.contains("captcha") || raw.contains("token") {
-                        return Err(Error::Parse(format!(
-                            "login requires captcha; use: lanzou login --cookie-str 'PHPSESSID=...; ylogin=...'  body={raw}"
-                        )));
-                    }
-                    return Err(Error::Parse(format!("login failed: {raw}")));
-                }
-                last_err = Error::Parse(format!("login failed via {post_url}: {raw}"));
-                continue;
-            }
-            if self.cookie.is_empty() {
-                last_err = Error::Parse("login ok but empty cookie".into());
-                continue;
-            }
-            if !self.verification() {
-                last_err = Error::Parse(format!(
-                    "login cookie not accepted by verification; body={raw}"
-                ));
-                continue;
-            }
-            if let Some(p) = &self.cookie_file {
-                fs::write(p, &self.cookie)?;
-            }
-            return Ok(());
+        if self.cookie.is_empty() {
+            return Err(Error::Parse("login ok but no Set-Cookie received".into()));
         }
-        Err(last_err)
+        if let Some(p) = &self.cookie_file {
+            fs::write(p, &self.cookie)?;
+        }
+        Ok(())
     }
+
 
     /// True when session cookie is still valid.
 
@@ -336,30 +253,30 @@ impl Account {
     }
 
     /// List folders + files under `folder_id` (`"-1"` = root).
+    /// Folders via task=47, files via task=5.
     pub fn list(&self, folder_id: &str) -> Result<Vec<ListEntry>> {
-        let folder_id = if folder_id.is_empty() {
-            "-1"
-        } else {
-            folder_id
-        };
-        let html = self.get_html(&format!("myfile.php?folder_id={folder_id}"))?;
+        let folder_id = if folder_id.is_empty() { "-1" } else { folder_id };
         let mut out = Vec::new();
 
-        // Prefer robust regex for folders
-        let re_folder = Regex::new(
-            r#"onclick="modify\((\d+)\)"[\s\S]*?<span>([^<]*)</span>[\s\S]*?<a href="([^"]*)"[\s\S]*?<div class="folders1">([^<]*)</div>"#,
-        )
-        .unwrap();
-        for cap in re_folder.captures_iter(&html) {
-            out.push(ListEntry {
-                kind: EntryKind::Folder,
-                id: cap[1].to_string(),
-                name: cap[2].to_string(),
-                url: Some(cap[3].to_string()),
-                size: None,
-                time: None,
-                description: Some(cap[4].trim().to_string()),
-            });
+        let raw_dir = self.post_task(&format!("task=47&folder_id={folder_id}"))?;
+        let vdir: Value = serde_json::from_str(&raw_dir)
+            .map_err(|e| Error::Parse(format!("list folders json: {e}; {raw_dir}")))?;
+        if let Some(arr) = vdir.get("text").and_then(|t| t.as_array()) {
+            for it in arr {
+                let id = json_str(&it["fol_id"]);
+                if id.is_empty() {
+                    continue;
+                }
+                out.push(ListEntry {
+                    kind: EntryKind::Folder,
+                    id,
+                    name: json_str(&it["name"]),
+                    url: None,
+                    size: None,
+                    time: None,
+                    description: Some(json_str(&it["folder_des"])).filter(|s| !s.is_empty()),
+                });
+            }
         }
 
         let raw = self.post_task(&format!("task=5&folder_id={folder_id}"))?;
@@ -368,7 +285,6 @@ impl Account {
         if let Some(arr) = v.get("text").and_then(|t| t.as_array()) {
             for it in arr {
                 let id = json_str(&it["id"]);
-                let desc = self.get_file_describe(&id).ok();
                 out.push(ListEntry {
                     kind: EntryKind::File,
                     id,
@@ -376,7 +292,7 @@ impl Account {
                     url: None,
                     size: Some(json_str(&it["size"])).filter(|s| !s.is_empty()),
                     time: Some(json_str(&it["time"])).filter(|s| !s.is_empty()),
-                    description: desc,
+                    description: None,
                 });
             }
         }
@@ -681,18 +597,3 @@ fn str_intercept(s: &str, start: &str, end: &str) -> String {
 }
 
 
-fn extract_formhash(html: &str) -> String {
-    let re = Regex::new(r#"name=["']formhash["']\s+value=["']([^"']+)["']"#).unwrap();
-    if let Some(c) = re.captures(html) {
-        return c[1].to_string();
-    }
-    let re2 = Regex::new(r#"value=["']([^"']+)["']\s+name=["']formhash["']"#).unwrap();
-    if let Some(c) = re2.captures(html) {
-        return c[1].to_string();
-    }
-    let re3 = Regex::new(r#"formhash['"]?\s*[:=]\s*['"]([^'"]+)['"]"#).unwrap();
-    if let Some(c) = re3.captures(html) {
-        return c[1].to_string();
-    }
-    "03e22cb9".into()
-}
