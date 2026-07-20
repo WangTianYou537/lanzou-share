@@ -1,8 +1,13 @@
-//! Lanzou (蓝奏云) share link resolver.
+//! Lanzou (蓝奏云) share link resolver and account manager.
+//!
+//! Includes public/password share resolve and control-panel APIs
+//! (login / folder / file) ported from `lanzou.class.php`.
 
+mod account;
 mod acw;
 mod error;
 
+pub use account::{Account, EntryKind, FileInfo, FolderInfo, ListEntry};
 pub use acw::{calc_acw_sc_v2, extract_arg1, is_acw_challenge, solve_from_html, MASK, PERM};
 pub use error::{Error, Result};
 

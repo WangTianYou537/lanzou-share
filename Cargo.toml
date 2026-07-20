@@ -1,9 +1,9 @@
 [package]
 name = "lanzou-share"
-version = "0.1.1"
+version = "0.1.3"
 edition = "2021"
 rust-version = "1.70"
-description = "Lanzou (蓝奏云) public/password share link resolver with acw_sc__v2 and CDN risk bypass"
+description = "Lanzou (蓝奏云) share resolver + account manager (login/folder/file) with acw_sc__v2 bypass"
 license = "MIT"
 readme = "README.md"
 repository = "https://github.com/WangTianYou537/lanzou-share"
