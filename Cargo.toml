@@ -1,0 +1,37 @@
+[package]
+name = "lanzou-share"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.70"
+description = "Lanzou (蓝奏云) public/password share link resolver with acw_sc__v2 and CDN risk bypass"
+license = "MIT"
+readme = "README.md"
+repository = "https://github.com/wantu/lanzou-share"
+homepage = "https://github.com/wantu/lanzou-share"
+documentation = "https://docs.rs/lanzou-share"
+keywords = ["lanzou", "download", "share", "cloud"]
+categories = ["network-programming", "web-programming::http-client"]
+exclude = ["target/"]
+
+[dependencies]
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "cookies", "gzip", "json", "rustls-tls"] }
+regex = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "1"
+url = "2"
+urlencoding = "2"
+clap = { version = "4", features = ["derive"], optional = true }
+
+[features]
+default = ["cli"]
+cli = ["dep:clap"]
+
+[[bin]]
+name = "lanzou"
+path = "src/bin/lanzou.rs"
+required-features = ["cli"]
+
+[lib]
+name = "lanzou_share"
+path = "src/lib.rs"
