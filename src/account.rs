@@ -62,7 +62,8 @@ impl<R: Read> Read for ProgressReader<R> {
         if n > 0 && self.total > 0 {
             self.read += n as u64;
             let now = Instant::now();
-            let pct = (self.read * 1000 / self.total) as i32;
+            // whole-percent so \r lines stay sparse when piped/logged
+            let pct = (self.read * 100 / self.total) as i32;
             if now.duration_since(self.last_at).as_millis() >= 200
                 || pct != self.last_pct
                 || self.read >= self.total
@@ -71,7 +72,7 @@ impl<R: Read> Read for ProgressReader<R> {
                 self.last_pct = pct;
                 let p = self.read as f64 * 100.0 / self.total as f64;
                 eprint!(
-                    "\r[upload] {}  {:5.1}%  {}/{}  ",
+                    "\r[upload] {}  {:5.1}%  {}/{}          ",
                     self.label,
                     p,
                     crate::human_bytes(self.read),

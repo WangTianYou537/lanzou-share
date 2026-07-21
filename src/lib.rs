@@ -750,6 +750,7 @@ impl Client {
         let mut buf = [0u8; 64 * 1024];
         let mut read: u64 = 0;
         let mut last = std::time::Instant::now() - std::time::Duration::from_secs(1);
+        let mut last_pct: i32 = -1;
         let label = name.clone();
         let total = content_length;
         if total == 0 {
@@ -764,11 +765,13 @@ impl Client {
             read += n as u64;
             if total > 0 {
                 let now = std::time::Instant::now();
-                if now.duration_since(last).as_millis() >= 200 || read >= total {
+                let pct_i = (read * 100 / total) as i32;
+                if now.duration_since(last).as_millis() >= 200 || pct_i != last_pct || read >= total {
                     last = now;
+                    last_pct = pct_i;
                     let pct = read as f64 * 100.0 / total as f64;
                     eprint!(
-                        "\r[download] {label}  {pct:5.1}%  {}/{}  ",
+                        "\r[download] {label}  {pct:5.1}%  {}/{}          ",
                         human_bytes(read),
                         human_bytes(total)
                     );
@@ -863,6 +866,7 @@ impl Client {
         let mut buf = [0u8; 64 * 1024];
         let mut read: u64 = 0;
         let mut last = std::time::Instant::now() - std::time::Duration::from_secs(1);
+        let mut last_pct: i32 = -1;
         let label = name.clone();
         if total == 0 {
             eprint!("\r[download] {label}  ...");
@@ -876,11 +880,13 @@ impl Client {
             read += n as u64;
             if total > 0 {
                 let now = std::time::Instant::now();
-                if now.duration_since(last).as_millis() >= 200 || read >= total {
+                let pct_i = (read * 100 / total) as i32;
+                if now.duration_since(last).as_millis() >= 200 || pct_i != last_pct || read >= total {
                     last = now;
+                    last_pct = pct_i;
                     let pct = read as f64 * 100.0 / total as f64;
                     eprint!(
-                        "\r[download] {label}  {pct:5.1}%  {}/{}  ",
+                        "\r[download] {label}  {pct:5.1}%  {}/{}          ",
                         human_bytes(read),
                         human_bytes(total)
                     );

@@ -1114,9 +1114,9 @@ fn resolve_by_notes(
             }
         }
     }
-    // split notes
+    // split notes: group by group_id (same orig name may have multiple uploads)
     let mut groups: HashMap<String, (String, String, Vec<ResolvedPart>)> = HashMap::new();
-    // key -> (group_id, orig_name, parts)
+    // key=group_id -> (group_id, orig_name, parts)
     for e in list {
         if e.kind != EntryKind::File {
             continue;
@@ -1127,10 +1127,10 @@ fn resolve_by_notes(
             .or_else(|| e.description.clone())
             .unwrap_or_default();
         if let Some(pm) = parse_part_note(&note) {
-            let key = if pm.name.is_empty() {
-                pm.group_id.to_lowercase()
+            let key = if pm.group_id.is_empty() {
+                format!("{}#{}", pm.name.to_lowercase(), e.id)
             } else {
-                pm.name.to_lowercase()
+                pm.group_id.clone()
             };
             let ent = groups.entry(key).or_insert_with(|| {
                 (pm.group_id.clone(), pm.name.clone(), Vec::new())
@@ -1147,7 +1147,67 @@ fn resolve_by_notes(
             });
         }
     }
-    if let Some((_, name, mut parts)) = groups.remove(&lt) {
+    // exact group id
+    if let Some((gid, name, mut parts)) = groups.remove(target) {
+        if !parts.is_empty() {
+            parts.sort_by_key(|p| p.index);
+            let orig = if name.is_empty() {
+                target.to_string()
+            } else {
+                name
+            };
+            let _ = gid;
+            return Some(ResolvedDownload {
+                kind: "split".into(),
+                orig_name: orig,
+                file_id: String::new(),
+                file_name: String::new(),
+                parts,
+            });
+        }
+    }
+    // by original name: prefer complete + newest (max file id)
+    let mut candidates: Vec<(String, String, Vec<ResolvedPart>)> = groups
+        .into_values()
+        .filter(|(_, name, parts)| name.eq_ignore_ascii_case(target) && !parts.is_empty())
+        .collect();
+    if !candidates.is_empty() {
+        candidates.sort_by(|a, b| {
+            let score = |parts: &Vec<ResolvedPart>, total_hint: usize| {
+                let mut seen = std::collections::HashSet::new();
+                let mut max_id: u64 = 0;
+                for p in parts {
+                    seen.insert(p.index);
+                    if let Ok(id) = p.file_id.parse::<u64>() {
+                        if id > max_id {
+                            max_id = id;
+                        }
+                    }
+                }
+                let n = seen.len();
+                let want = if total_hint > 0 { total_hint } else { n };
+                let complete = if n >= want && want > 0 { 1 } else { 0 };
+                (complete, max_id, n)
+            };
+            let ta = a.2.first().map(|p| p.total).unwrap_or(0);
+            let tb = b.2.first().map(|p| p.total).unwrap_or(0);
+            score(&b.2, tb).cmp(&score(&a.2, ta))
+        });
+        let (_gid, name, parts_in) = candidates.remove(0);
+        // dedupe index keep highest file id
+        let mut best: HashMap<usize, ResolvedPart> = HashMap::new();
+        for p in parts_in {
+            best.entry(p.index)
+                .and_modify(|cur| {
+                    let a = cur.file_id.parse::<u64>().unwrap_or(0);
+                    let b = p.file_id.parse::<u64>().unwrap_or(0);
+                    if b > a {
+                        *cur = p.clone();
+                    }
+                })
+                .or_insert(p);
+        }
+        let mut parts: Vec<ResolvedPart> = best.into_values().collect();
         parts.sort_by_key(|p| p.index);
         let orig = if name.is_empty() {
             target.to_string()
@@ -1161,23 +1221,6 @@ fn resolve_by_notes(
             file_name: String::new(),
             parts,
         });
-    }
-    for (_, (gid, name, mut parts)) in groups {
-        if gid == target && !parts.is_empty() {
-            parts.sort_by_key(|p| p.index);
-            let orig = if name.is_empty() {
-                target.to_string()
-            } else {
-                name
-            };
-            return Some(ResolvedDownload {
-                kind: "split".into(),
-                orig_name: orig,
-                file_id: String::new(),
-                file_name: String::new(),
-                parts,
-            });
-        }
     }
     None
 }

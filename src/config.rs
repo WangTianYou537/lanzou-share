@@ -25,8 +25,9 @@ pub struct Config {
     /// Chunk size in MB (1..=100, default 90).
     #[serde(default = "default_split_size")]
     pub split_size_mb: u32,
-    /// Part name template. Default `{name}_part{index:03d}.{suffix}`.
-    /// Avoid `{name}.part{index}.zip` — Lanzou rejects `*.partNNN.zip` (error 7071).
+    /// Part name template. Default `{name}_s{index:03d}.{suffix}`.
+    /// Avoid `*partNNN*` names — Lanzou CDN returns offline ERROR:102 on large files;
+    /// also avoid `{name}.part{index}.zip` (server error 7071).
     #[serde(default = "default_split_format")]
     pub split_name_format: String,
     /// Write part metadata into file description after upload.
@@ -50,7 +51,7 @@ fn default_split_size() -> u32 {
     90
 }
 fn default_split_format() -> String {
-    "{name}_part{index:03d}.{suffix}".into()
+    "{name}_s{index:03d}.{suffix}".into()
 }
 
 impl Default for Config {
