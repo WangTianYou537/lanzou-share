@@ -469,16 +469,11 @@ impl Account {
             .ok_or_else(|| Error::Parse("invalid filename".into()))?
             .to_string();
 
-        let mut urls = vec![
-            format!("{}html5up.php", self.base),
-            format!("{}fileup.php", self.base),
-        ];
+        let mut urls = vec![format!("{}html5up.php", self.base)];
         if self.base.contains("up.woozooo.com") {
             urls.push("https://pc.woozooo.com/html5up.php".into());
-            urls.push("https://pc.woozooo.com/fileup.php".into());
         } else if self.base.contains("pc.woozooo.com") {
             urls.push("https://up.woozooo.com/html5up.php".into());
-            urls.push("https://up.woozooo.com/fileup.php".into());
         }
 
         let mut last_err = Error::Http("upload failed".into());
