@@ -1023,23 +1023,10 @@ fn resolve_entry<'a>(list: &'a [ListEntry], target: &str) -> Option<&'a ListEntr
 
 fn download_share(share_url: &str, pwd: &str, out_dir: &Path, filename: &str) -> Result<(), String> {
     let mut client = Client::new().map_err(|e| e.to_string())?;
-    let opts = ParseOptions {
-        password: if pwd.is_empty() {
-            None
-        } else {
-            Some(pwd.to_string())
-        },
-        resolve_direct: true,
-    };
-    let res = client.parse(share_url, opts).map_err(|e| e.to_string())?;
-    let u = res.direct.as_deref().unwrap_or(res.telecom.as_str());
-    let name = if filename.is_empty() {
-        res.filename.as_deref()
-    } else {
-        Some(filename)
-    };
+    let pwd = if pwd.is_empty() { None } else { Some(pwd) };
+    let name = if filename.is_empty() { None } else { Some(filename) };
     client
-        .download(u, out_dir, name, None)
+        .download_share(share_url, pwd, out_dir, name)
         .map(|_| ())
         .map_err(|e| e.to_string())
 }
@@ -1252,7 +1239,7 @@ fn download_split_group(
 ) -> Result<(), String> {
     std::fs::create_dir_all(out_dir).map_err(|e| e.to_string())?;
     let total = r.parts.len();
-    println!("[download] split {}  parts={total}", r.orig_name);
+    println!("[download] split {}  parts={total}  (serial)", r.orig_name);
     let mut files: Vec<(usize, PathBuf)> = Vec::new();
     let mut fail = 0usize;
     for (i, p) in r.parts.iter().enumerate() {
@@ -1279,6 +1266,9 @@ fn download_split_group(
                 let _ = std::fs::remove_file(&downloaded);
                 files.push((p.index, raw));
                 println!("[ok {n}/{total}] part {}", p.index);
+                if n < total {
+                    std::thread::sleep(std::time::Duration::from_millis(500));
+                }
             }
             Err(e) => {
                 fail += 1;

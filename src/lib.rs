@@ -450,18 +450,40 @@ impl Client {
     }
 
     /// Resolve CDN pseudo URL to downloadable URL.
+    ///
+    /// If the first CDN response is already a file stream, this discards the body
+    /// and returns `cdn_url` for a second GET. Prefer [`Client::download_share`]
+    /// for large one-shot links.
     pub fn resolve_direct_url(&mut self, cdn_url: &str) -> Result<String> {
-        let referer = if self.origin.is_empty() {
-            "https://www.lanzou.com/".to_string()
-        } else {
-            format!("{}/", self.origin)
-        };
+        self.resolve_direct_url_with_referer(cdn_url, None)
+    }
+
+    pub fn resolve_direct_url_with_referer(
+        &mut self,
+        cdn_url: &str,
+        share_referer: Option<&str>,
+    ) -> Result<String> {
+        let referer = share_referer
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| {
+                if self.origin.is_empty() {
+                    "https://www.lanzou.com/".to_string()
+                } else {
+                    format!("{}/", self.origin)
+                }
+            });
         let mut req = self
             .http
             .get(cdn_url)
             .header(REFERER, referer)
             .header(ACCEPT_LANGUAGE, "zh-CN,zh;q=0.9,en;q=0.8")
-            .header(ACCEPT, "*/*");
+            .header(
+                ACCEPT,
+                "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            )
+            .header("Sec-Fetch-Dest", "document")
+            .header("Sec-Fetch-Mode", "navigate")
+            .header("Sec-Fetch-Site", "cross-site");
         if let Some(c) = self.cookie_header() {
             req = req.header(COOKIE, c);
         }
@@ -479,7 +501,7 @@ impl Client {
 
         let mut bytes = Vec::new();
         let mut r = resp;
-        let mut take = [0u8; 256];
+        let mut take = [0u8; 512];
         let n = r.read(&mut take)?;
         bytes.extend_from_slice(&take[..n]);
         if looks_like_file(&bytes, &ct) {
@@ -487,6 +509,11 @@ impl Client {
         }
         r.read_to_end(&mut bytes)?;
         let text = String::from_utf8_lossy(&bytes);
+        if let Some(code) = extract_cdn_error(&text) {
+            return Err(Error::Cdn(format!(
+                "cdn offline ERROR:{code} (file may be expired/unavailable)"
+            )));
+        }
         if is_cdn_risk_page(&text) {
             return self.resolve_via_ajax(cdn_url, &text);
         }
@@ -550,6 +577,214 @@ impl Client {
             last_err = format!("zt={zt} url={final_url}");
         }
         Err(Error::Cdn(format!("ajax risk failed: {last_err}")))
+    }
+
+    /// Parse a share link and download in one flow, streaming the CDN body when
+    /// the first response is already the file (avoids one-shot token burn).
+    pub fn download_share(
+        &mut self,
+        share_url: &str,
+        password: Option<&str>,
+        dest_dir: impl AsRef<Path>,
+        filename: Option<&str>,
+    ) -> Result<PathBuf> {
+        let dest_dir = dest_dir.as_ref();
+        let mut last = Error::Cdn("download share failed".into());
+        for attempt in 1..=3 {
+            if attempt > 1 {
+                thread::sleep(Duration::from_secs(attempt as u64));
+            }
+            let mut nc = Client::new()?;
+            let opts = ParseOptions {
+                password: password.map(|s| s.to_string()),
+                resolve_direct: false,
+            };
+            let res = match nc.parse(share_url, opts) {
+                Ok(r) => r,
+                Err(e) => {
+                    last = e;
+                    continue;
+                }
+            };
+            let name = filename
+                .map(|s| s.to_string())
+                .or(res.filename.clone());
+            for cdn in [&res.telecom, &res.normal] {
+                if cdn.is_empty() {
+                    continue;
+                }
+                match nc.download_cdn_stream(cdn, share_url, dest_dir, name.as_deref()) {
+                    Ok(p) => return Ok(p),
+                    Err(e) => last = e,
+                }
+            }
+        }
+        Err(last)
+    }
+
+    /// GET cdn_url once: if body is file, save it; if risk HTML, ajax then download.
+    fn download_cdn_stream(
+        &mut self,
+        cdn_url: &str,
+        share_referer: &str,
+        dest_dir: &Path,
+        filename: Option<&str>,
+    ) -> Result<PathBuf> {
+        let mut req = self
+            .http
+            .get(cdn_url)
+            .header(REFERER, share_referer)
+            .header(ACCEPT_LANGUAGE, "zh-CN,zh;q=0.9,en;q=0.8")
+            .header(
+                ACCEPT,
+                "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            )
+            .header("Sec-Fetch-Dest", "document")
+            .header("Sec-Fetch-Mode", "navigate")
+            .header("Sec-Fetch-Site", "cross-site")
+            .timeout(Duration::from_secs(120 * 60));
+        if let Some(c) = self.cookie_header() {
+            req = req.header(COOKIE, c);
+        }
+        let resp = req.send()?;
+        self.store_cookies(resp.headers());
+        if !resp.status().is_success() {
+            return Err(Error::Cdn(format!("status {}", resp.status())));
+        }
+        let ct = resp
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        let content_disp = resp
+            .headers()
+            .get("content-disposition")
+            .cloned();
+        let content_length = resp.content_length().unwrap_or(0);
+
+        let mut head = vec![0u8; 512];
+        let mut r = resp;
+        let n = r.read(&mut head)?;
+        head.truncate(n);
+        if looks_like_file(&head, &ct) {
+            // Stream head + rest to disk (single GET).
+            return self.save_download_stream(
+                ChainReader {
+                    head: Some(head),
+                    rest: r,
+                },
+                dest_dir,
+                filename,
+                content_length,
+                content_disp.as_ref(),
+                cdn_url,
+            );
+        }
+        let mut body = head;
+        r.read_to_end(&mut body)?;
+        let text = String::from_utf8_lossy(&body);
+        if let Some(code) = extract_cdn_error(&text) {
+            return Err(Error::Cdn(format!(
+                "cdn offline ERROR:{code} (file may be expired/unavailable)"
+            )));
+        }
+        if is_cdn_risk_page(&text) {
+            let final_url = self.resolve_via_ajax(cdn_url, &text)?;
+            return self.download(
+                &final_url,
+                dest_dir,
+                filename,
+                Some(share_referer),
+            );
+        }
+        Err(Error::Cdn(format!(
+            "unknown CDN response ct={ct} head={:?}",
+            &body[..body.len().min(60)]
+        )))
+    }
+
+    fn save_download_stream<R: Read>(
+        &mut self,
+        mut reader: R,
+        dest_dir: &Path,
+        filename: Option<&str>,
+        content_length: u64,
+        content_disp: Option<&reqwest::header::HeaderValue>,
+        raw_url: &str,
+    ) -> Result<PathBuf> {
+        std::fs::create_dir_all(dest_dir)?;
+        let name = filename
+            .map(|s| s.to_string())
+            .or_else(|| filename_from_cd(content_disp))
+            .or_else(|| filename_from_url(raw_url))
+            .or_else(|| self.last_filename.clone())
+            .unwrap_or_else(|| format!("lanzou_{}.bin", now_ts()));
+        let name = Path::new(&name)
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("download.bin")
+            .to_string();
+        let mut out_path = dest_dir.join(&name);
+        if out_path.exists() {
+            let stem = out_path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("file");
+            let ext = out_path
+                .extension()
+                .and_then(|s| s.to_str())
+                .map(|e| format!(".{e}"))
+                .unwrap_or_default();
+            let mut i = 1;
+            loop {
+                let candidate = dest_dir.join(format!("{stem}({i}){ext}"));
+                if !candidate.exists() {
+                    out_path = candidate;
+                    break;
+                }
+                i += 1;
+            }
+        }
+        let mut file = File::create(&out_path)?;
+        let mut buf = [0u8; 64 * 1024];
+        let mut read: u64 = 0;
+        let mut last = std::time::Instant::now() - std::time::Duration::from_secs(1);
+        let label = name.clone();
+        let total = content_length;
+        if total == 0 {
+            eprint!("\r[download] {label}  ...");
+        }
+        loop {
+            let n = reader.read(&mut buf)?;
+            if n == 0 {
+                break;
+            }
+            file.write_all(&buf[..n])?;
+            read += n as u64;
+            if total > 0 {
+                let now = std::time::Instant::now();
+                if now.duration_since(last).as_millis() >= 200 || read >= total {
+                    last = now;
+                    let pct = read as f64 * 100.0 / total as f64;
+                    eprint!(
+                        "\r[download] {label}  {pct:5.1}%  {}/{}  ",
+                        human_bytes(read),
+                        human_bytes(total)
+                    );
+                }
+            }
+        }
+        if total > 0 {
+            eprintln!(
+                "\r[download] {label}  100.0%  {}/{}          ",
+                human_bytes(total),
+                human_bytes(total)
+            );
+        } else {
+            eprintln!("\r[download] {label}  done                    ");
+        }
+        Ok(out_path)
     }
 
     /// Download URL to local path; returns saved path.
@@ -749,6 +984,45 @@ impl AjaxRiskResp {
 fn is_cdn_risk_page(html: &str) -> bool {
     (html.contains("ajax.php") && html.contains("down_r"))
         || (html.contains("系统发现您的网络异常") && html.contains("ajax.php"))
+        || (html.contains("ajax.php") && html.contains("el"))
+}
+
+/// Extract code from offline pages like `ERROR:102`.
+fn extract_cdn_error(html: &str) -> Option<String> {
+    if let Some(caps) = Regex::new(r"(?i)ERROR\s*[:：]\s*(\d+)")
+        .ok()
+        .and_then(|re| re.captures(html))
+    {
+        return Some(caps.get(1)?.as_str().to_string());
+    }
+    if html.contains("class=\"off0\"") || html.contains("class=\"off1\"") {
+        return Some("offline".into());
+    }
+    None
+}
+
+/// Reader that yields a small head buffer then the rest of an HTTP body.
+struct ChainReader<R> {
+    head: Option<Vec<u8>>,
+    rest: R,
+}
+
+impl<R: Read> Read for ChainReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if let Some(ref mut head) = self.head {
+            if !head.is_empty() {
+                let n = head.len().min(buf.len());
+                buf[..n].copy_from_slice(&head[..n]);
+                head.drain(..n);
+                if head.is_empty() {
+                    self.head = None;
+                }
+                return Ok(n);
+            }
+            self.head = None;
+        }
+        self.rest.read(buf)
+    }
 }
 
 fn looks_like_file(chunk: &[u8], content_type: &str) -> bool {
@@ -777,7 +1051,10 @@ fn looks_like_file(chunk: &[u8], content_type: &str) -> bool {
     }
     let head = String::from_utf8_lossy(&chunk[..chunk.len().min(20)]).to_ascii_lowercase();
     let t = head.trim_start();
-    !(t.starts_with("<!doctype") || t.starts_with("<html") || t.starts_with("<script"))
+    if t.starts_with("<!doctype") || t.starts_with("<html") || t.starts_with("<script") {
+        return false;
+    }
+    false
 }
 
 fn filename_from_cd(h: Option<&reqwest::header::HeaderValue>) -> Option<String> {
