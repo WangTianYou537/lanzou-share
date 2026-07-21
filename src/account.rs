@@ -451,8 +451,12 @@ impl Account {
         self.post_task(&format!("task=6&file_id={file_id}"))
     }
 
-    /// Upload a local file via `fileup.php` (task=1 multipart).
-    /// Protocol aligned with common Lanzou web clients.
+    /// Upload a local file via `html5up.php` (browser HTML5 upload).
+    ///
+    /// ```text
+    /// POST https://pc.woozooo.com/html5up.php
+    /// multipart: task=1, folder_id=<id>, upload_file=@file
+    /// ```
     pub fn upload(&self, local_path: impl AsRef<Path>, folder_id: &str) -> Result<UploadResult> {
         let local_path = local_path.as_ref();
         let folder_id = if folder_id.is_empty() { "-1" } else { folder_id };
@@ -465,10 +469,15 @@ impl Account {
             .ok_or_else(|| Error::Parse("invalid filename".into()))?
             .to_string();
 
-        let mut urls = vec![format!("{}fileup.php", self.base)];
+        let mut urls = vec![
+            format!("{}html5up.php", self.base),
+            format!("{}fileup.php", self.base),
+        ];
         if self.base.contains("up.woozooo.com") {
+            urls.push("https://pc.woozooo.com/html5up.php".into());
             urls.push("https://pc.woozooo.com/fileup.php".into());
         } else if self.base.contains("pc.woozooo.com") {
+            urls.push("https://up.woozooo.com/html5up.php".into());
             urls.push("https://up.woozooo.com/fileup.php".into());
         }
 
@@ -483,20 +492,17 @@ impl Account {
                 .map_err(|e| Error::Http(e.to_string()))?;
             let form = Form::new()
                 .text("task", "1")
-                .text("vie", "2")
-                .text("ve", "2")
-                .text("id", "WU_FILE_0")
-                .text("folder_id_bb_n", folder_id.to_string())
-                .text("name", filename.clone())
+                .text("folder_id", folder_id.to_string())
                 .part("upload_file", part);
 
+            let referer = format!("{}mydisk.php", self.base);
             let mut req = self
                 .http
                 .post(&up_url)
                 .timeout(Duration::from_secs(3600))
                 .header(USER_AGENT, DEFAULT_UA)
                 .header(reqwest::header::ACCEPT_LANGUAGE, "zh-CN,zh;q=0.9,en;q=0.8")
-                .header(reqwest::header::REFERER, &self.base)
+                .header(reqwest::header::REFERER, &referer)
                 .multipart(form);
             if !self.cookie.is_empty() {
                 req = req.header(COOKIE, &self.cookie);
@@ -542,6 +548,25 @@ impl Account {
                         name = n;
                     } else if !n2.is_empty() {
                         name = n2;
+                    }
+                }
+            } else if let Some(obj) = v.get("text").and_then(|t| t.as_object()) {
+                file_id = json_str(&obj["id"]);
+                let n = json_str(&obj["name"]);
+                let n2 = json_str(&obj["name_all"]);
+                if !n.is_empty() {
+                    name = n;
+                } else if !n2.is_empty() {
+                    name = n2;
+                }
+            }
+            if file_id.is_empty() {
+                file_id = json_str(&v["id"]);
+                if file_id.is_empty() {
+                    if let Some(info) = v.get("info").and_then(|i| i.as_object()) {
+                        file_id = json_str(&info["id"]);
+                    } else {
+                        file_id = json_str(&v["info"]);
                     }
                 }
             }
