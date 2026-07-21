@@ -29,7 +29,7 @@ fn ensure_cookie_dir(path: &Path) {
 }
 
 #[derive(Parser, Debug)]
-#[command(name = "lanzou", about = "Lanzou share resolve + account CLI")]
+#[command(name = "lanzou", about = "Lanzou share resolve + account CLI", version = lanzou_share::VERSION)]
 struct Cli {
     /// Interactive shell (cd / ls / download)
     #[arg(short = 'i', long = "interactive", global = true)]

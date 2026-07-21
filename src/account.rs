@@ -670,7 +670,20 @@ impl Account {
                 }
             }
             let mut res = self.upload_one(&up_path, &up_name, folder_id)?;
-            res.orig_name = Some(orig_name);
+            res.orig_name = Some(orig_name.clone());
+            // Record original name when suffix was converted.
+            if !res.file_id.is_empty() && up_name != orig_name {
+                let note = crate::config::format_convert_note(
+                    &orig_name,
+                    &up_name,
+                    &cfg.suffix_mode,
+                    &cfg.suffix_name,
+                    size,
+                );
+                if let Err(e) = self.set_file_describe(&res.file_id, &note) {
+                    eprintln!("[warn] set convert note: {e}");
+                }
+            }
             return Ok(res);
         }
 
@@ -965,7 +978,9 @@ pub fn unescape_list(
     enabled: bool,
 ) -> Vec<DisplayEntry> {
     if !enabled {
-        return list.iter().map(flat_entry).collect();
+        let mut out: Vec<DisplayEntry> = list.iter().map(flat_entry).collect();
+        apply_convert_notes(&mut out, notes);
+        return out;
     }
     use std::collections::BTreeMap;
     let mut groups: BTreeMap<String, (crate::config::PartMeta, Vec<ListEntry>)> = BTreeMap::new();
@@ -996,6 +1011,7 @@ pub fn unescape_list(
         }
     }
     let mut out: Vec<DisplayEntry> = plain.iter().map(flat_entry).collect();
+    apply_convert_notes(&mut out, notes);
     for (gid, (meta, mut parts)) in groups {
         parts.sort_by_key(|p| {
             let n = notes
@@ -1058,6 +1074,33 @@ fn flat_entry(e: &ListEntry) -> DisplayEntry {
         size: e.size.clone().unwrap_or_default(),
         extra,
         parts: Vec::new(),
+    }
+}
+
+fn apply_convert_notes(rows: &mut [DisplayEntry], notes: &HashMap<String, String>) {
+    for row in rows.iter_mut() {
+        if row.kind != "FILE" {
+            continue;
+        }
+        let note = notes.get(&row.id).cloned().unwrap_or_default();
+        let Some(cm) = crate::config::parse_convert_note(&note) else {
+            continue;
+        };
+        if cm.name.is_empty() {
+            continue;
+        }
+        let as_name = if cm.as_name.is_empty() {
+            row.name.clone()
+        } else {
+            cm.as_name.clone()
+        };
+        row.name = cm.name;
+        let hint = format!("as={} mode={}", as_name, cm.mode);
+        if row.extra.is_empty() {
+            row.extra = hint;
+        } else {
+            row.extra = format!("{}  {}", row.extra, hint);
+        }
     }
 }
 
