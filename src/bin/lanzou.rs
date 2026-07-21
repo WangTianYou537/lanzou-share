@@ -1473,15 +1473,36 @@ fn cmd_download(
 
 // ---------- interactive ----------
 
+struct PathSeg {
+    id: String,
+    name: String,
+}
+
 struct Shell {
     acc: Account,
-    folder: String,
-    stack: Vec<String>,
+    path: Vec<PathSeg>,
     cookie: PathBuf,
     out_dir: String,
     jobs: usize,
     user: String,
     pass: String,
+}
+
+impl Shell {
+    fn folder_id(&self) -> &str {
+        self.path.last().map(|s| s.id.as_str()).unwrap_or("-1")
+    }
+    fn path_string(&self) -> String {
+        if self.path.is_empty() {
+            return "/".into();
+        }
+        let mut s = String::new();
+        for seg in &self.path {
+            s.push('/');
+            s.push_str(&seg.name);
+        }
+        s
+    }
 }
 
 fn cmd_interactive(
@@ -1512,8 +1533,7 @@ fn cmd_interactive(
 
     let mut sh = Shell {
         acc,
-        folder: "-1".into(),
-        stack: Vec::new(),
+        path: Vec::new(),
         cookie,
         out_dir: output_dir,
         jobs,
@@ -1525,7 +1545,7 @@ fn cmd_interactive(
     let stdin = io::stdin();
     let mut stdout = io::stdout();
     loop {
-        print!("lanzou:{}> ", sh.folder);
+        print!("lanzou:{}> ", sh.path_string());
         let _ = stdout.flush();
         let mut line = String::new();
         match stdin.lock().read_line(&mut line) {
@@ -1583,7 +1603,7 @@ impl Shell {
         let args = &parts[1..];
         match cmd {
             "help" | "?" => {
-                println!("ls|ll|list|dir | cd <id|name|/|..> | pwd");
+                println!("ls|ll|list|dir | cd <name|id|/abs/path|..|.> | pwd");
                 println!("download|dl|down|fetch <id|name> [-j N] [-o DIR]");
                 println!("info|show|stat <id|name> | upload|up|put <path>");
                 println!("mkdir|md <name> | rm|delete|del|remove <id|name>");
@@ -1593,17 +1613,17 @@ impl Shell {
             }
             "exit" | "quit" | "q" => Ok(true),
             "pwd" => {
-                println!("{}", self.folder);
+                println!("{}", self.path_string());
                 Ok(false)
             }
             "ls" | "ll" | "list" | "dir" => {
-                let list = self.acc.list(&self.folder).map_err(|e| e.to_string())?;
-                print_list(&self.acc, &self.folder, &list, true);
+                let list = self.acc.list(self.folder_id()).map_err(|e| e.to_string())?;
+                print_list(&self.acc, &self.path_string(), &list, true);
                 Ok(false)
             }
             "cd" => {
                 if args.is_empty() {
-                    return Err("usage: cd <id|name|/|..>".into());
+                    return Err("usage: cd <name|id|/abs/path|..|.>".into());
                 }
                 self.cd(&args[0])?;
                 Ok(false)
@@ -1625,7 +1645,7 @@ impl Shell {
                 }
                 let res = self
                     .acc
-                    .upload(Path::new(&args[0]), &self.folder)
+                    .upload(Path::new(&args[0]), self.folder_id())
                     .map_err(|e| e.to_string())?;
                 println!("[ok] uploaded {} {}", res.file_id, res.name);
                 Ok(false)
@@ -1635,7 +1655,7 @@ impl Shell {
                     return Err("usage: mkdir <name>".into());
                 }
                 self.acc
-                    .create_folder(&args[0], &self.folder, "")
+                    .create_folder(&args[0], self.folder_id(), "")
                     .map_err(|e| e.to_string())?;
                 println!("[ok] mkdir {}", args[0]);
                 Ok(false)
@@ -1669,35 +1689,67 @@ impl Shell {
     }
 
     fn cd(&mut self, target: &str) -> Result<(), String> {
-        if target == "/" || target == "~" || target == "root" {
-            self.folder = "-1".into();
-            self.stack.clear();
+        let target = target.trim();
+        if target.is_empty() || target == "." {
             return Ok(());
         }
-        if target == ".." {
-            if let Some(p) = self.stack.pop() {
-                self.folder = p;
+        if target.starts_with('/') || target == "~" || target == "root" {
+            self.path.clear();
+            let rest = if target == "~" || target == "root" {
+                ""
             } else {
-                self.folder = "-1".into();
+                target.trim_start_matches('/')
+            };
+            if rest.is_empty() {
+                return Ok(());
             }
-            return Ok(());
+            return self.cd_relative(rest);
         }
-        let list = self.acc.list(&self.folder).map_err(|e| e.to_string())?;
-        if let Some(e) = resolve_entry(&list, target) {
-            if e.kind != EntryKind::Folder {
-                return Err(format!("{} is a file, not a folder", e.name));
+        self.cd_relative(target)
+    }
+
+    fn cd_relative(&mut self, rel: &str) -> Result<(), String> {
+        let rel = rel.replace('\\', "/");
+        for p in rel.split('/') {
+            let p = p.trim();
+            if p.is_empty() || p == "." {
+                continue;
             }
-            self.stack.push(self.folder.clone());
-            self.folder = e.id.clone();
-            println!("cd -> {} ({})", e.name, e.id);
-            return Ok(());
+            if p == ".." {
+                self.path.pop();
+                continue;
+            }
+            let cur = self.folder_id().to_string();
+            let list = self.acc.list(&cur).map_err(|e| e.to_string())?;
+            if let Some(e) = resolve_entry(&list, p) {
+                if e.kind != EntryKind::Folder {
+                    return Err(format!("{} is a file, not a folder", e.name));
+                }
+                self.path.push(PathSeg {
+                    id: e.id.clone(),
+                    name: e.name.clone(),
+                });
+                continue;
+            }
+            if is_digits(p) {
+                let mut name = p.to_string();
+                if let Ok(info) = self.acc.get_folder_info(p) {
+                    if !info.name.is_empty() {
+                        name = info.name;
+                    }
+                }
+                self.path.push(PathSeg {
+                    id: p.into(),
+                    name,
+                });
+                continue;
+            }
+            return Err(format!(
+                "folder not found: {p} (at {})",
+                self.path_string()
+            ));
         }
-        if is_digits(target) {
-            self.stack.push(self.folder.clone());
-            self.folder = target.into();
-            return Ok(());
-        }
-        Err(format!("folder not found: {target}"))
+        Ok(())
     }
 
     fn cmd_download(&self, args: &[String]) -> Result<(), String> {
@@ -1726,11 +1778,11 @@ impl Shell {
             }
             i += 1;
         }
-        download_target(&self.acc, &self.folder, target, Path::new(&out_dir), jobs)
+        download_target(&self.acc, self.folder_id(), target, Path::new(&out_dir), jobs)
     }
 
     fn cmd_info(&self, target: &str) -> Result<(), String> {
-        let list = self.acc.list(&self.folder).map_err(|e| e.to_string())?;
+        let list = self.acc.list(self.folder_id()).map_err(|e| e.to_string())?;
         if let Some(e) = resolve_entry(&list, target) {
             match e.kind {
                 EntryKind::File => {
@@ -1768,7 +1820,7 @@ impl Shell {
     }
 
     fn cmd_rm(&self, target: &str) -> Result<(), String> {
-        delete_target(&self.acc, &self.folder, target)
+        delete_target(&self.acc, self.folder_id(), target)
     }
 
     fn cmd_login(&mut self, args: &[String]) -> Result<(), String> {
