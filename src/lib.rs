@@ -1100,7 +1100,7 @@ fn now_ts() -> u64 {
 }
 
 
-fn human_bytes(n: u64) -> String {
+pub(crate) fn human_bytes(n: u64) -> String {
     if n < 1024 {
         return format!("{n}B");
     }

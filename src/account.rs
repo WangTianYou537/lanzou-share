@@ -11,7 +11,7 @@ use std::fs;
 use std::fs::File;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const DEFAULT_ACCOUNT_BASE: &str = "https://pc.woozooo.com/";
 const DEFAULT_UA: &str =
@@ -30,6 +30,58 @@ const UPLOAD_ALLOWED_EXTS: &[&str] = &[
     "bds", "bdi", "ssf", "it", "pkg", "cfg", "mp4", "avi", "png", "jpeg", "jpg",
     "gif", "webp", "brushset",
 ];
+
+
+/// Streaming reader that prints upload progress to stderr.
+struct ProgressReader<R> {
+    inner: R,
+    total: u64,
+    read: u64,
+    label: String,
+    last_pct: i32,
+    last_at: Instant,
+}
+
+impl<R: Read> ProgressReader<R> {
+    fn new(inner: R, total: u64, label: impl Into<String>) -> Self {
+        Self {
+            inner,
+            total,
+            read: 0,
+            label: label.into(),
+            last_pct: -1,
+            last_at: Instant::now() - Duration::from_secs(1),
+        }
+    }
+
+}
+
+impl<R: Read> Read for ProgressReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        if n > 0 && self.total > 0 {
+            self.read += n as u64;
+            let now = Instant::now();
+            let pct = (self.read * 1000 / self.total) as i32;
+            if now.duration_since(self.last_at).as_millis() >= 200
+                || pct != self.last_pct
+                || self.read >= self.total
+            {
+                self.last_at = now;
+                self.last_pct = pct;
+                let p = self.read as f64 * 100.0 / self.total as f64;
+                eprint!(
+                    "\r[upload] {}  {:5.1}%  {}/{}  ",
+                    self.label,
+                    p,
+                    crate::human_bytes(self.read),
+                    crate::human_bytes(self.total)
+                );
+            }
+        }
+        Ok(n)
+    }
+}
 
 /// Whether `ext` (with or without leading `.`) is accepted by html5up.php.
 pub fn is_upload_allowed_ext(ext: &str) -> bool {
@@ -669,6 +721,20 @@ impl Account {
                     return res;
                 }
             }
+            if up_name != orig_name {
+                eprintln!(
+                    "[upload] convert {} -> {}  size={}",
+                    orig_name,
+                    up_name,
+                    crate::human_bytes(ust)
+                );
+            } else {
+                eprintln!(
+                    "[upload] single {}  size={}",
+                    up_name,
+                    crate::human_bytes(ust)
+                );
+            }
             let mut res = self.upload_one(&up_path, &up_name, folder_id)?;
             res.orig_name = Some(orig_name.clone());
             // Always write JSON note (raw or convert).
@@ -702,6 +768,13 @@ impl Account {
         cfg: &crate::config::Config,
         chunk_bytes: u64,
     ) -> Result<UploadResult> {
+        let meta_size = fs::metadata(local_path).map(|m| m.len()).unwrap_or(0);
+        eprintln!(
+            "[upload] split {}  size={}  chunk={}  ...",
+            orig_name,
+            crate::human_bytes(meta_size),
+            crate::human_bytes(chunk_bytes)
+        );
         let (paths, sizes) = split_file(local_path, chunk_bytes)?;
         let _paths_guard = MultiTempGuard(paths.clone());
         let total = paths.len();
@@ -711,6 +784,9 @@ impl Account {
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_nanos())
                 .unwrap_or(0)
+        );
+        eprintln!(
+            "[upload] split ready  parts={total}  group={group_id}"
         );
         let suffix = if cfg.suffix_name.is_empty() {
             "zip".to_string()
@@ -763,9 +839,18 @@ impl Account {
                     "part {index} too large after convert: {ust} bytes"
                 )));
             }
+            eprintln!(
+                "[upload] part {index}/{total}  name={up_name}  payload={}  raw={}",
+                crate::human_bytes(ust),
+                crate::human_bytes(sizes[i])
+            );
             let res = self
                 .upload_one(&up_path, &up_name, folder_id)
                 .map_err(|e| Error::Parse(format!("upload part {index}/{total}: {e}")))?;
+            eprintln!(
+                "[ok {index}/{total}] part {index} id={} name={}",
+                res.file_id, res.name
+            );
             staged.push(Staged {
                 file_id: res.file_id,
                 name: res.name,
@@ -774,6 +859,7 @@ impl Account {
             });
         }
 
+        eprintln!("[upload] writing part notes ({total})...");
         let mut parts = Vec::with_capacity(total);
         for (i, sp) in staged.iter().enumerate() {
             let next = if i + 1 < staged.len() {
@@ -806,6 +892,10 @@ impl Account {
         if parts.is_empty() {
             return Err(Error::Parse("split upload produced no parts".into()));
         }
+        eprintln!(
+            "[upload] split done  parts={}  group={}  orig={}",
+            total, group_id, orig_name
+        );
         Ok(UploadResult {
             file_id: parts[0].file_id.clone(),
             name: parts[0].name.clone(),
@@ -825,12 +915,12 @@ impl Account {
             urls.push("https://up.woozooo.com/html5up.php".into());
         }
 
+        let file_size = fs::metadata(local_path)?.len();
         let mut last_err = Error::Http("upload failed".into());
         for up_url in urls {
-            let mut file = File::open(local_path)?;
-            let mut buf = Vec::new();
-            file.read_to_end(&mut buf)?;
-            let part = Part::bytes(buf)
+            let file = File::open(local_path)?;
+            let prog = ProgressReader::new(file, file_size, filename.to_string());
+            let part = Part::reader_with_length(prog, file_size)
                 .file_name(filename.to_string())
                 .mime_str("application/octet-stream")
                 .map_err(|e| Error::Http(e.to_string()))?;
@@ -914,6 +1004,11 @@ impl Account {
                     }
                 }
             }
+            eprintln!(
+                "\r[upload] {filename}  100.0%  {}/{}          ",
+                crate::human_bytes(file_size),
+                crate::human_bytes(file_size)
+            );
             return Ok(UploadResult {
                 file_id,
                 name,
