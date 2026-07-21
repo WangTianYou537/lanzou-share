@@ -717,8 +717,14 @@ impl Account {
         } else {
             cfg.suffix_name.clone()
         };
-        let mut parts = Vec::with_capacity(total);
-        let mut first: Option<UploadResult> = None;
+
+        struct Staged {
+            file_id: String,
+            name: String,
+            size: u64,
+            index: usize,
+        }
+        let mut staged: Vec<Staged> = Vec::with_capacity(total);
 
         for (i, p) in paths.iter().enumerate() {
             let index = i + 1;
@@ -760,36 +766,55 @@ impl Account {
             let res = self
                 .upload_one(&up_path, &up_name, folder_id)
                 .map_err(|e| Error::Parse(format!("upload part {index}/{total}: {e}")))?;
-            // Always write part JSON note.
-            if !res.file_id.is_empty() {
+            staged.push(Staged {
+                file_id: res.file_id,
+                name: res.name,
+                size: sizes[i],
+                index,
+            });
+        }
+
+        let mut parts = Vec::with_capacity(total);
+        for (i, sp) in staged.iter().enumerate() {
+            let next = if i + 1 < staged.len() {
+                staged[i + 1].file_id.as_str()
+            } else {
+                ""
+            };
+            if !sp.file_id.is_empty() {
                 let note = crate::notes::format_part_note(
                     &group_id,
                     orig_name,
-                    &up_name,
-                    index,
+                    &sp.name,
+                    sp.index,
                     total,
-                    sizes[i],
+                    sp.size,
+                    next,
                 );
-                if let Err(e) = self.set_file_describe(&res.file_id, &note) {
-                    eprintln!("[warn] set part note {index}: {e}");
+                if let Err(e) = self.set_file_describe(&sp.file_id, &note) {
+                    eprintln!("[warn] set part note {}: {e}", sp.index);
                 }
             }
             parts.push(UploadPart {
-                file_id: res.file_id.clone(),
-                name: res.name.clone(),
-                index,
+                file_id: sp.file_id.clone(),
+                name: sp.name.clone(),
+                index: sp.index,
                 total,
-                size: sizes[i],
+                size: sp.size,
             });
-            if first.is_none() {
-                first = Some(res);
-            }
         }
-        let mut first = first.ok_or_else(|| Error::Parse("split upload produced no parts".into()))?;
-        first.parts = parts;
-        first.orig_name = Some(orig_name.to_string());
-        first.group_id = Some(group_id);
-        Ok(first)
+        if parts.is_empty() {
+            return Err(Error::Parse("split upload produced no parts".into()));
+        }
+        Ok(UploadResult {
+            file_id: parts[0].file_id.clone(),
+            name: parts[0].name.clone(),
+            folder_id: folder_id.to_string(),
+            raw_json: String::new(),
+            parts,
+            orig_name: Some(orig_name.to_string()),
+            group_id: Some(group_id),
+        })
     }
 
     fn upload_one(&self, local_path: &Path, filename: &str, folder_id: &str) -> Result<UploadResult> {

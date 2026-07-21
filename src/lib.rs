@@ -622,15 +622,44 @@ impl Client {
             }
         }
 
+        let total = resp.content_length().unwrap_or(0);
         let mut file = File::create(&out_path)?;
         let mut reader = resp;
         let mut buf = [0u8; 64 * 1024];
+        let mut read: u64 = 0;
+        let mut last = std::time::Instant::now() - std::time::Duration::from_secs(1);
+        let label = name.clone();
+        if total == 0 {
+            eprint!("\r[download] {label}  ...");
+        }
         loop {
             let n = reader.read(&mut buf)?;
             if n == 0 {
                 break;
             }
             file.write_all(&buf[..n])?;
+            read += n as u64;
+            if total > 0 {
+                let now = std::time::Instant::now();
+                if now.duration_since(last).as_millis() >= 200 || read >= total {
+                    last = now;
+                    let pct = read as f64 * 100.0 / total as f64;
+                    eprint!(
+                        "\r[download] {label}  {pct:5.1}%  {}/{}  ",
+                        human_bytes(read),
+                        human_bytes(total)
+                    );
+                }
+            }
+        }
+        if total > 0 {
+            eprintln!(
+                "\r[download] {label}  100.0%  {}/{}          ",
+                human_bytes(total),
+                human_bytes(total)
+            );
+        } else {
+            eprintln!("\r[download] {label}  done                    ");
         }
         Ok(out_path)
     }
@@ -791,4 +820,19 @@ fn now_ts() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+
+fn human_bytes(n: u64) -> String {
+    if n < 1024 {
+        return format!("{n}B");
+    }
+    let mut f = n as f64;
+    for u in ["KB", "MB", "GB", "TB"] {
+        f /= 1024.0;
+        if f < 1024.0 {
+            return format!("{f:.1}{u}");
+        }
+    }
+    format!("{:.1}PB", f / 1024.0)
 }

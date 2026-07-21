@@ -3,7 +3,7 @@
 //! ```json
 //! {"v":1,"kind":"raw","name":"a.txt","as":"a.txt","size":12}
 //! {"v":1,"kind":"convert","name":"a.dex","as":"a.dex.zip","mode":"zip","suffix":"zip","size":20}
-//! {"v":1,"kind":"part","id":"...","name":"big.bin","as":"big_part001.zip","index":1,"total":3,"size":1048576}
+//! {"v":1,"kind":"part","id":"...","name":"big.bin","as":"big_part001.zip","index":1,"total":3,"size":1048576,"next":"FILEID2"}
 //! ```
 
 use serde::{Deserialize, Serialize};
@@ -33,6 +33,9 @@ pub struct FileNote {
     pub total: usize,
     #[serde(default, skip_serializing_if = "is_zero_u64")]
     pub size: u64,
+    /// Next part remote file id (kind=part).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub next: String,
 }
 
 fn default_v() -> u32 {
@@ -92,6 +95,7 @@ pub fn format_part_note(
     index: usize,
     total: usize,
     size: u64,
+    next_file_id: &str,
 ) -> String {
     serde_json::to_string(&FileNote {
         v: NOTE_VERSION,
@@ -102,6 +106,7 @@ pub fn format_part_note(
         index,
         total,
         size,
+        next: next_file_id.into(),
         ..Default::default()
     })
     .unwrap_or_default()
@@ -116,6 +121,7 @@ pub struct PartMeta {
     pub index: usize,
     pub total: usize,
     pub size: u64,
+    pub next: String,
 }
 
 /// Parsed convert/raw metadata.
@@ -176,6 +182,7 @@ pub fn parse_part_note(desc: &str) -> Option<PartMeta> {
         index: n.index,
         total: n.total,
         size: n.size,
+        next: n.next,
     })
 }
 
