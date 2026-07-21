@@ -1,8 +1,10 @@
 use clap::{Parser, Subcommand};
 use lanzou_share::{
-    config_keys, config_path_used, get_config, get_config_value, is_upload_allowed_ext, save_config,
-    set_config_value, unescape_list, Account, Client, EntryKind, Error, ListEntry, ParseOptions,
+    config_keys, config_path_used, get_config, get_config_value, is_upload_allowed_ext,
+    parse_convert_note, parse_part_note, save_config, set_config_value, unescape_list, Account,
+    Client, EntryKind, Error, ListEntry, ParseOptions,
 };
+use std::collections::HashMap;
 use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -960,8 +962,271 @@ fn download_file_by_id(acc: &Account, file_id: &str, name: &str, out_dir: &Path)
     if share.is_empty() {
         return Err(format!("empty share url for file {file_id}"));
     }
-    println!("[download] file id={file_id} name={name}");
-    download_share(&share, &pwd, out_dir, name)
+    let mut save_name = name.to_string();
+    if let Ok(desc) = acc.get_file_describe(file_id) {
+        if let Some(cm) = parse_convert_note(&desc) {
+            if !cm.name.is_empty() {
+                save_name = cm.name;
+            }
+        }
+    }
+    println!("[download] file id={file_id} name={save_name}");
+    download_share(&share, &pwd, out_dir, &save_name)?;
+    let saved = out_dir.join(&save_name);
+    if needs_unzip_convert(&saved, &save_name) {
+        let raw = out_dir.join(format!("{save_name}.raw"));
+        if unzip_single_to(&saved, &raw).is_ok() {
+            let _ = std::fs::remove_file(&saved);
+            let _ = std::fs::rename(&raw, &saved);
+            println!("[download] extracted original payload -> {}", saved.display());
+        }
+    }
+    Ok(())
+}
+
+#[derive(Clone)]
+struct ResolvedDownload {
+    kind: String, // file | split
+    orig_name: String,
+    file_id: String,
+    file_name: String,
+    parts: Vec<ResolvedPart>,
+}
+
+#[derive(Clone)]
+struct ResolvedPart {
+    file_id: String,
+    name: String,
+    index: usize,
+    total: usize,
+    size: u64,
+}
+
+fn resolve_by_notes(
+    list: &[ListEntry],
+    notes: &HashMap<String, String>,
+    target: &str,
+) -> Option<ResolvedDownload> {
+    let lt = target.trim().to_lowercase();
+    if lt.is_empty() {
+        return None;
+    }
+    // convert notes
+    for e in list {
+        if e.kind != EntryKind::File {
+            continue;
+        }
+        let note = notes
+            .get(&e.id)
+            .cloned()
+            .or_else(|| e.description.clone())
+            .unwrap_or_default();
+        if let Some(cm) = parse_convert_note(&note) {
+            if cm.name.eq_ignore_ascii_case(target) {
+                let save = if cm.name.is_empty() {
+                    e.name.clone()
+                } else {
+                    cm.name.clone()
+                };
+                return Some(ResolvedDownload {
+                    kind: "file".into(),
+                    orig_name: cm.name,
+                    file_id: e.id.clone(),
+                    file_name: save,
+                    parts: Vec::new(),
+                });
+            }
+        }
+    }
+    // split notes
+    let mut groups: HashMap<String, (String, String, Vec<ResolvedPart>)> = HashMap::new();
+    // key -> (group_id, orig_name, parts)
+    for e in list {
+        if e.kind != EntryKind::File {
+            continue;
+        }
+        let note = notes
+            .get(&e.id)
+            .cloned()
+            .or_else(|| e.description.clone())
+            .unwrap_or_default();
+        if let Some(pm) = parse_part_note(&note) {
+            let key = if pm.name.is_empty() {
+                pm.group_id.to_lowercase()
+            } else {
+                pm.name.to_lowercase()
+            };
+            let ent = groups.entry(key).or_insert_with(|| {
+                (pm.group_id.clone(), pm.name.clone(), Vec::new())
+            });
+            if ent.1.is_empty() && !pm.name.is_empty() {
+                ent.1 = pm.name.clone();
+            }
+            ent.2.push(ResolvedPart {
+                file_id: e.id.clone(),
+                name: e.name.clone(),
+                index: pm.index,
+                total: pm.total,
+                size: pm.size,
+            });
+        }
+    }
+    if let Some((_, name, mut parts)) = groups.remove(&lt) {
+        parts.sort_by_key(|p| p.index);
+        let orig = if name.is_empty() {
+            target.to_string()
+        } else {
+            name
+        };
+        return Some(ResolvedDownload {
+            kind: "split".into(),
+            orig_name: orig,
+            file_id: String::new(),
+            file_name: String::new(),
+            parts,
+        });
+    }
+    for (_, (gid, name, mut parts)) in groups {
+        if gid == target && !parts.is_empty() {
+            parts.sort_by_key(|p| p.index);
+            let orig = if name.is_empty() {
+                target.to_string()
+            } else {
+                name
+            };
+            return Some(ResolvedDownload {
+                kind: "split".into(),
+                orig_name: orig,
+                file_id: String::new(),
+                file_name: String::new(),
+                parts,
+            });
+        }
+    }
+    None
+}
+
+fn needs_unzip_convert(path: &Path, want_name: &str) -> bool {
+    let file = match std::fs::File::open(path) {
+        Ok(f) => f,
+        Err(_) => return false,
+    };
+    let mut archive = match zip::ZipArchive::new(file) {
+        Ok(a) => a,
+        Err(_) => return false,
+    };
+    if archive.len() != 1 {
+        return false;
+    }
+    let name = archive.by_index(0).map(|f| f.name().to_string()).unwrap_or_default();
+    name == want_name || Path::new(&name).file_name().and_then(|s| s.to_str()) == Some(want_name)
+}
+
+fn unzip_single_to(zip_path: &Path, dest: &Path) -> Result<(), String> {
+    let file = std::fs::File::open(zip_path).map_err(|e| e.to_string())?;
+    let mut archive = zip::ZipArchive::new(file).map_err(|e| e.to_string())?;
+    if archive.is_empty() {
+        return Err("empty zip".into());
+    }
+    let mut entry = archive.by_index(0).map_err(|e| e.to_string())?;
+    let mut out = std::fs::File::create(dest).map_err(|e| e.to_string())?;
+    std::io::copy(&mut entry, &mut out).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+fn extract_part_payload(downloaded: &Path, prefer: &Path) -> Result<PathBuf, String> {
+    if let Ok(file) = std::fs::File::open(downloaded) {
+        if let Ok(mut archive) = zip::ZipArchive::new(file) {
+            if !archive.is_empty() {
+                let mut entry = archive.by_index(0).map_err(|e| e.to_string())?;
+                let mut out = std::fs::File::create(prefer).map_err(|e| e.to_string())?;
+                std::io::copy(&mut entry, &mut out).map_err(|e| e.to_string())?;
+                return Ok(prefer.to_path_buf());
+            }
+        }
+    }
+    std::fs::rename(downloaded, prefer)
+        .or_else(|_| {
+            std::fs::copy(downloaded, prefer).map(|_| {
+                let _ = std::fs::remove_file(downloaded);
+            })
+        })
+        .map_err(|e| e.to_string())?;
+    Ok(prefer.to_path_buf())
+}
+
+fn download_split_group(
+    acc: &Account,
+    r: &ResolvedDownload,
+    out_dir: &Path,
+    _jobs: usize,
+) -> Result<(), String> {
+    std::fs::create_dir_all(out_dir).map_err(|e| e.to_string())?;
+    let total = r.parts.len();
+    println!("[download] split {}  parts={total}", r.orig_name);
+    let mut files: Vec<(usize, PathBuf)> = Vec::new();
+    let mut fail = 0usize;
+    for (i, p) in r.parts.iter().enumerate() {
+        let n = i + 1;
+        let part_name = format!(".{}.part{:03}.download", sanitize_name(&r.orig_name), p.index);
+        let (share, pwd) = match acc.get_file_download_info(&p.file_id) {
+            Ok(v) => v,
+            Err(e) => {
+                fail += 1;
+                eprintln!("[fail {n}/{total}] part {}: {e}", p.index);
+                continue;
+            }
+        };
+        if let Err(e) = download_share(&share, &pwd, out_dir, &part_name) {
+            fail += 1;
+            let _ = std::fs::remove_file(out_dir.join(&part_name));
+            eprintln!("[fail {n}/{total}] part {}: {e}", p.index);
+            continue;
+        }
+        let downloaded = out_dir.join(&part_name);
+        let prefer = out_dir.join(format!(".part-{:03}.bin", p.index));
+        match extract_part_payload(&downloaded, &prefer) {
+            Ok(raw) => {
+                let _ = std::fs::remove_file(&downloaded);
+                files.push((p.index, raw));
+                println!("[ok {n}/{total}] part {}", p.index);
+            }
+            Err(e) => {
+                fail += 1;
+                let _ = std::fs::remove_file(&downloaded);
+                eprintln!("[fail {n}/{total}] part {} extract: {e}", p.index);
+            }
+        }
+    }
+    if fail > 0 {
+        for (_, p) in &files {
+            let _ = std::fs::remove_file(p);
+        }
+        return Err(format!("{fail}/{total} split parts failed"));
+    }
+    files.sort_by_key(|(i, _)| *i);
+    let out_path = out_dir.join(sanitize_name(&r.orig_name));
+    let mut out = std::fs::File::create(&out_path).map_err(|e| e.to_string())?;
+    for (_, p) in files {
+        let mut inp = std::fs::File::open(&p).map_err(|e| e.to_string())?;
+        std::io::copy(&mut inp, &mut out).map_err(|e| e.to_string())?;
+        let _ = std::fs::remove_file(p);
+    }
+    println!("[done] merged: {}", out_path.display());
+    Ok(())
+}
+
+fn download_resolved(
+    acc: &Account,
+    r: ResolvedDownload,
+    out_dir: &Path,
+    jobs: usize,
+) -> Result<(), String> {
+    if r.kind == "split" {
+        download_split_group(acc, &r, out_dir, jobs)
+    } else {
+        download_file_by_id(acc, &r.file_id, &r.file_name, out_dir)
+    }
 }
 
 fn collect_folder_files(
@@ -1058,10 +1323,22 @@ fn download_target(
     jobs: usize,
 ) -> Result<(), String> {
     let list = acc.list(cur_folder).map_err(|e| e.to_string())?;
+    let notes = acc.fetch_notes(&list);
+    if let Some(r) = resolve_by_notes(&list, &notes, target) {
+        return download_resolved(acc, r, out_dir, jobs);
+    }
     if let Some(e) = resolve_entry(&list, target) {
         match e.kind {
             EntryKind::File => {
-                return download_file_by_id(acc, &e.id, &e.name, out_dir);
+                let mut name = e.name.clone();
+                if let Some(note) = notes.get(&e.id) {
+                    if let Some(cm) = parse_convert_note(note) {
+                        if !cm.name.is_empty() {
+                            name = cm.name;
+                        }
+                    }
+                }
+                return download_file_by_id(acc, &e.id, &name, out_dir);
             }
             EntryKind::Folder => {
                 let dest = out_dir.join(sanitize_name(&e.name));
