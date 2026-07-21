@@ -45,16 +45,25 @@ fn file_ext(name: &str) -> String {
         .to_ascii_lowercase()
 }
 
-fn zip_single_file(src: &Path) -> Result<(PathBuf, String)> {
+fn zip_single_file(src: &Path, suffix_name: &str) -> Result<(PathBuf, String)> {
     let base = src
         .file_name()
         .and_then(|s| s.to_str())
         .ok_or_else(|| Error::Parse("invalid filename".into()))?
         .to_string();
-    let zip_name = format!("{base}.zip");
+    let suffix = if suffix_name.is_empty() {
+        "zip"
+    } else {
+        suffix_name
+    };
+    let upload_name = format!("{base}.{suffix}");
     let tmp = std::env::temp_dir().join(format!(
-        "lanzou-up-{}-{zip_name}",
-        std::process::id()
+        "lanzou-up-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
     ));
     let file = File::create(&tmp)?;
     let mut zip = zip::ZipWriter::new(file);
@@ -69,22 +78,31 @@ fn zip_single_file(src: &Path) -> Result<(PathBuf, String)> {
         .map_err(|e| Error::Parse(format!("zip write: {e}")))?;
     zip.finish()
         .map_err(|e| Error::Parse(format!("zip finish: {e}")))?;
-    Ok((tmp, zip_name))
+    Ok((tmp, upload_name))
 }
 
-/// Validate size/ext; auto-zip unsupported suffixes. Returns (path, upload_name, temp_to_remove).
-fn prepare_upload_path(local_path: &Path) -> Result<(PathBuf, String, Option<PathBuf>)> {
-    let meta = fs::metadata(local_path)?;
-    if !meta.is_file() {
-        return Err(Error::Parse(format!("not a file: {}", local_path.display())));
-    }
-    if meta.len() > MAX_UPLOAD_BYTES {
-        return Err(Error::Parse(format!(
-            "file too large: {} bytes (max {} MB)",
-            meta.len(),
-            MAX_UPLOAD_BYTES / (1024 * 1024)
-        )));
-    }
+fn rename_copy(src: &Path) -> Result<PathBuf> {
+    let tmp = std::env::temp_dir().join(format!(
+        "lanzou-up-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    fs::copy(src, &tmp)?;
+    Ok(tmp)
+}
+
+fn is_archive_suffix(ext: &str) -> bool {
+    matches!(
+        ext.trim_start_matches('.').to_ascii_lowercase().as_str(),
+        "zip" | "rar" | "7z" | "tar"
+    )
+}
+
+/// Apply suffix_auto_convert policy for a single ≤100MB file.
+fn convert_suffix(local_path: &Path, cfg: &crate::config::Config) -> Result<(PathBuf, String, Option<PathBuf>)> {
     let name = local_path
         .file_name()
         .and_then(|s| s.to_str())
@@ -93,17 +111,75 @@ fn prepare_upload_path(local_path: &Path) -> Result<(PathBuf, String, Option<Pat
     if is_upload_allowed_ext(&file_ext(&name)) {
         return Ok((local_path.to_path_buf(), name, None));
     }
-    let (zp, zn) = zip_single_file(local_path)?;
-    let zmeta = fs::metadata(&zp)?;
-    if zmeta.len() > MAX_UPLOAD_BYTES {
-        let _ = fs::remove_file(&zp);
+    if !cfg.suffix_auto_convert {
         return Err(Error::Parse(format!(
-            "zipped file too large: {} bytes (max {} MB)",
-            zmeta.len(),
-            MAX_UPLOAD_BYTES / (1024 * 1024)
+            "suffix .{} not allowed by server (set suffix_auto_convert=true or rename)",
+            file_ext(&name)
         )));
     }
-    Ok((zp.clone(), zn, Some(zp)))
+    let suffix = if cfg.suffix_name.is_empty() {
+        "zip".into()
+    } else {
+        cfg.suffix_name.clone()
+    };
+    if !is_upload_allowed_ext(&suffix) {
+        return Err(Error::Parse(format!(
+            "configured suffix_name .{suffix} is not on server whitelist"
+        )));
+    }
+    if cfg.suffix_mode == "rename" {
+        let upload_name = format!("{name}.{suffix}");
+        let p = rename_copy(local_path)?;
+        Ok((p.clone(), upload_name, Some(p)))
+    } else {
+        let (zp, zn) = zip_single_file(local_path, &suffix)?;
+        Ok((zp.clone(), zn, Some(zp)))
+    }
+}
+
+fn split_file(local_path: &Path, chunk_bytes: u64) -> Result<(Vec<PathBuf>, Vec<u64>)> {
+    let mut f = File::open(local_path)?;
+    let mut paths = Vec::new();
+    let mut sizes = Vec::new();
+    let mut buf = vec![0u8; 1024 * 1024];
+    let mut idx = 0usize;
+    loop {
+        let tmp = std::env::temp_dir().join(format!(
+            "lanzou-part-{}-{}-{}",
+            std::process::id(),
+            idx,
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let mut out = File::create(&tmp)?;
+        let mut written: u64 = 0;
+        while written < chunk_bytes {
+            let to_read = std::cmp::min(buf.len() as u64, chunk_bytes - written) as usize;
+            let n = f.read(&mut buf[..to_read])?;
+            if n == 0 {
+                break;
+            }
+            out.write_all(&buf[..n])?;
+            written += n as u64;
+        }
+        drop(out);
+        if written == 0 {
+            let _ = fs::remove_file(&tmp);
+            break;
+        }
+        paths.push(tmp);
+        sizes.push(written);
+        idx += 1;
+        if written < chunk_bytes {
+            break;
+        }
+    }
+    if paths.is_empty() {
+        return Err(Error::Parse("empty file, nothing to split".into()));
+    }
+    Ok((paths, sizes))
 }
 
 /// Entry type: folder or file.
@@ -540,21 +616,164 @@ impl Account {
         self.post_task(&format!("task=6&file_id={file_id}"))
     }
 
-    /// Upload a local file via `html5up.php` (browser HTML5 upload).
+    /// Upload a local file via `html5up.php`.
     ///
-    /// ```text
-    /// POST https://pc.woozooo.com/html5up.php
-    /// multipart: task=1, folder_id=<id>, upload_file=@file
-    /// ```
-    ///
-    /// Server limits: max 100MB; restricted suffix whitelist. Unsupported
-    /// suffixes (e.g. `.dex`) are automatically packed into a `.zip`.
+    /// Behaviour is controlled by [`crate::config::get_config`]:
+    /// suffix conversion, large-file split, and part notes.
     pub fn upload(&self, local_path: impl AsRef<Path>, folder_id: &str) -> Result<UploadResult> {
         let local_path = local_path.as_ref();
         let folder_id = if folder_id.is_empty() { "-1" } else { folder_id };
-        let (upload_path, filename, temp) = prepare_upload_path(local_path)?;
-        let _guard = TempGuard(temp);
+        let cfg = crate::config::get_config();
+        let meta = fs::metadata(local_path)?;
+        if !meta.is_file() {
+            return Err(Error::Parse(format!("not a file: {}", local_path.display())));
+        }
+        let orig_name = local_path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .ok_or_else(|| Error::Parse("invalid filename".into()))?
+            .to_string();
+        let size = meta.len();
+        let mut chunk_bytes = (cfg.split_size_mb as u64) * 1024 * 1024;
+        if chunk_bytes < 1 {
+            chunk_bytes = 90 * 1024 * 1024;
+        }
+        if chunk_bytes > MAX_UPLOAD_BYTES {
+            chunk_bytes = MAX_UPLOAD_BYTES;
+        }
 
+        let mut need_split = cfg.split_enable && size > chunk_bytes;
+        if !cfg.split_enable && size > MAX_UPLOAD_BYTES {
+            return Err(Error::Parse(format!(
+                "file too large: {size} bytes (max {} MB; enable split_enable or shrink file)",
+                MAX_UPLOAD_BYTES / (1024 * 1024)
+            )));
+        }
+
+        if !need_split {
+            let (up_path, up_name, temp) = convert_suffix(local_path, &cfg)?;
+            let _guard = TempGuard(temp.clone());
+            let ust = fs::metadata(&up_path)?.len();
+            if ust > MAX_UPLOAD_BYTES {
+                if !cfg.split_enable {
+                    return Err(Error::Parse(format!(
+                        "converted file too large: {ust} bytes (max {} MB)",
+                        MAX_UPLOAD_BYTES / (1024 * 1024)
+                    )));
+                }
+                need_split = true;
+                // drop guard ownership of temp — upload_split will clean via its own temps;
+                // keep converted file path for split source
+                if need_split {
+                    let res = self.upload_split(&up_path, &orig_name, folder_id, &cfg, chunk_bytes);
+                    return res;
+                }
+            }
+            let mut res = self.upload_one(&up_path, &up_name, folder_id)?;
+            res.orig_name = Some(orig_name);
+            return Ok(res);
+        }
+
+        self.upload_split(local_path, &orig_name, folder_id, &cfg, chunk_bytes)
+    }
+
+    fn upload_split(
+        &self,
+        local_path: &Path,
+        orig_name: &str,
+        folder_id: &str,
+        cfg: &crate::config::Config,
+        chunk_bytes: u64,
+    ) -> Result<UploadResult> {
+        let (paths, sizes) = split_file(local_path, chunk_bytes)?;
+        let _paths_guard = MultiTempGuard(paths.clone());
+        let total = paths.len();
+        let group_id = format!(
+            "{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        );
+        let suffix = if cfg.suffix_name.is_empty() {
+            "zip".to_string()
+        } else {
+            cfg.suffix_name.clone()
+        };
+        let mut parts = Vec::with_capacity(total);
+        let mut first: Option<UploadResult> = None;
+
+        for (i, p) in paths.iter().enumerate() {
+            let index = i + 1;
+            let mut part_name =
+                crate::config::format_split_name(&cfg.split_name_format, orig_name, index, total, &suffix);
+            if !is_upload_allowed_ext(&file_ext(&part_name)) {
+                part_name = format!("{part_name}.{suffix}");
+            }
+            let need_real_zip = cfg.suffix_mode == "zip" && is_archive_suffix(&suffix);
+            let (up_path, up_name, temp) = if need_real_zip {
+                let (zp, _zn) = zip_single_file(p, &suffix)?;
+                let mut uname = part_name.clone();
+                if file_ext(&uname) != suffix {
+                    uname = format!(
+                        "{}.{}",
+                        Path::new(&uname)
+                            .file_stem()
+                            .and_then(|s| s.to_str())
+                            .unwrap_or(&uname),
+                        suffix
+                    );
+                }
+                (zp.clone(), uname, Some(zp))
+            } else {
+                let mut uname = part_name.clone();
+                if !is_upload_allowed_ext(&file_ext(&uname)) {
+                    uname = format!("{uname}.{suffix}");
+                }
+                let cp = rename_copy(p)?;
+                (cp.clone(), uname, Some(cp))
+            };
+            let _g = TempGuard(temp);
+            let ust = fs::metadata(&up_path)?.len();
+            if ust > MAX_UPLOAD_BYTES {
+                return Err(Error::Parse(format!(
+                    "part {index} too large after convert: {ust} bytes"
+                )));
+            }
+            let res = self
+                .upload_one(&up_path, &up_name, folder_id)
+                .map_err(|e| Error::Parse(format!("upload part {index}/{total}: {e}")))?;
+            if cfg.split_note && !res.file_id.is_empty() {
+                let note = crate::config::format_part_note(
+                    &group_id,
+                    orig_name,
+                    index,
+                    total,
+                    sizes[i],
+                );
+                if let Err(e) = self.set_file_describe(&res.file_id, &note) {
+                    eprintln!("[warn] set part note {index}: {e}");
+                }
+            }
+            parts.push(UploadPart {
+                file_id: res.file_id.clone(),
+                name: res.name.clone(),
+                index,
+                total,
+                size: sizes[i],
+            });
+            if first.is_none() {
+                first = Some(res);
+            }
+        }
+        let mut first = first.ok_or_else(|| Error::Parse("split upload produced no parts".into()))?;
+        first.parts = parts;
+        first.orig_name = Some(orig_name.to_string());
+        first.group_id = Some(group_id);
+        Ok(first)
+    }
+
+    fn upload_one(&self, local_path: &Path, filename: &str, folder_id: &str) -> Result<UploadResult> {
         let mut urls = vec![format!("{}html5up.php", self.base)];
         if self.base.contains("up.woozooo.com") {
             urls.push("https://pc.woozooo.com/html5up.php".into());
@@ -564,11 +783,11 @@ impl Account {
 
         let mut last_err = Error::Http("upload failed".into());
         for up_url in urls {
-            let mut file = File::open(&upload_path)?;
+            let mut file = File::open(local_path)?;
             let mut buf = Vec::new();
             file.read_to_end(&mut buf)?;
             let part = Part::bytes(buf)
-                .file_name(filename.clone())
+                .file_name(filename.to_string())
                 .mime_str("application/octet-stream")
                 .map_err(|e| Error::Http(e.to_string()))?;
             let form = Form::new()
@@ -619,7 +838,7 @@ impl Account {
                 continue;
             }
             let mut file_id = String::new();
-            let mut name = filename.clone();
+            let mut name = filename.to_string();
             if let Some(arr) = v.get("text").and_then(|t| t.as_array()) {
                 if let Some(row) = arr.first() {
                     file_id = json_str(&row["id"]);
@@ -656,13 +875,38 @@ impl Account {
                 name,
                 folder_id: folder_id.to_string(),
                 raw_json: raw,
+                parts: Vec::new(),
+                orig_name: None,
+                group_id: None,
             });
         }
         Err(last_err)
     }
+
+    /// Best-effort load of file descriptions for list unescape.
+    pub fn fetch_notes(&self, list: &[ListEntry]) -> HashMap<String, String> {
+        let mut out = HashMap::new();
+        for e in list {
+            if e.kind != EntryKind::File {
+                continue;
+            }
+            if let Some(d) = &e.description {
+                if d.contains("[lanzou-part]") {
+                    out.insert(e.id.clone(), d.clone());
+                    continue;
+                }
+            }
+            if let Ok(desc) = self.get_file_describe(&e.id) {
+                if !desc.is_empty() {
+                    out.insert(e.id.clone(), desc);
+                }
+            }
+        }
+        out
+    }
 }
 
-/// Removes a temporary upload zip on drop.
+/// Removes a temporary upload file on drop.
 struct TempGuard(Option<PathBuf>);
 impl Drop for TempGuard {
     fn drop(&mut self) {
@@ -672,13 +916,167 @@ impl Drop for TempGuard {
     }
 }
 
-/// Result of a successful upload.
+struct MultiTempGuard(Vec<PathBuf>);
+impl Drop for MultiTempGuard {
+    fn drop(&mut self) {
+        for p in self.0.drain(..) {
+            let _ = fs::remove_file(p);
+        }
+    }
+}
+
+/// One chunk of a split upload.
+#[derive(Debug, Clone)]
+pub struct UploadPart {
+    pub file_id: String,
+    pub name: String,
+    pub index: usize,
+    pub total: usize,
+    pub size: u64,
+}
+
+/// Result of a successful upload (single or multi-part).
 #[derive(Debug, Clone)]
 pub struct UploadResult {
     pub file_id: String,
     pub name: String,
     pub folder_id: String,
     pub raw_json: String,
+    pub parts: Vec<UploadPart>,
+    pub orig_name: Option<String>,
+    pub group_id: Option<String>,
+}
+
+/// Display row after optional split-unescape grouping.
+#[derive(Debug, Clone)]
+pub struct DisplayEntry {
+    pub kind: String, // DIR | FILE | SPLIT
+    pub id: String,
+    pub name: String,
+    pub size: String,
+    pub extra: String,
+    pub parts: Vec<ListEntry>,
+}
+
+/// Group split parts (via description notes) into virtual rows.
+pub fn unescape_list(
+    list: &[ListEntry],
+    notes: &HashMap<String, String>,
+    enabled: bool,
+) -> Vec<DisplayEntry> {
+    if !enabled {
+        return list.iter().map(flat_entry).collect();
+    }
+    use std::collections::BTreeMap;
+    let mut groups: BTreeMap<String, (crate::config::PartMeta, Vec<ListEntry>)> = BTreeMap::new();
+    let mut plain: Vec<ListEntry> = Vec::new();
+    for e in list {
+        if e.kind == EntryKind::Folder {
+            plain.push(e.clone());
+            continue;
+        }
+        let note = notes
+            .get(&e.id)
+            .cloned()
+            .or_else(|| e.description.clone())
+            .unwrap_or_default();
+        if let Some(meta) = crate::config::parse_part_note(&note) {
+            let ent = groups
+                .entry(meta.group_id.clone())
+                .or_insert_with(|| (meta.clone(), Vec::new()));
+            if ent.0.name.is_empty() && !meta.name.is_empty() {
+                ent.0.name = meta.name.clone();
+            }
+            if meta.total > ent.0.total {
+                ent.0.total = meta.total;
+            }
+            ent.1.push(e.clone());
+        } else {
+            plain.push(e.clone());
+        }
+    }
+    let mut out: Vec<DisplayEntry> = plain.iter().map(flat_entry).collect();
+    for (gid, (meta, mut parts)) in groups {
+        parts.sort_by_key(|p| {
+            let n = notes
+                .get(&p.id)
+                .cloned()
+                .or_else(|| p.description.clone())
+                .unwrap_or_default();
+            crate::config::parse_part_note(&n)
+                .map(|m| m.index)
+                .unwrap_or(0)
+        });
+        let name = if meta.name.is_empty() {
+            parts
+                .first()
+                .map(|p| p.name.clone())
+                .unwrap_or_else(|| gid.clone())
+        } else {
+            meta.name.clone()
+        };
+        let mut total_size = 0u64;
+        for p in &parts {
+            let n = notes
+                .get(&p.id)
+                .cloned()
+                .or_else(|| p.description.clone())
+                .unwrap_or_default();
+            if let Some(m) = crate::config::parse_part_note(&n) {
+                total_size += m.size;
+            }
+        }
+        let first_id = parts
+            .first()
+            .map(|p| p.id.clone())
+            .unwrap_or_default();
+        out.push(DisplayEntry {
+            kind: "SPLIT".into(),
+            id: first_id,
+            name,
+            size: human_size(total_size),
+            extra: format!("parts={}/{} group={gid}", parts.len(), meta.total),
+            parts,
+        });
+    }
+    out
+}
+
+fn flat_entry(e: &ListEntry) -> DisplayEntry {
+    let (kind, extra) = if e.kind == EntryKind::Folder {
+        (
+            "DIR".into(),
+            e.description.clone().unwrap_or_default(),
+        )
+    } else {
+        ("FILE".into(), e.size.clone().unwrap_or_default())
+    };
+    DisplayEntry {
+        kind,
+        id: e.id.clone(),
+        name: e.name.clone(),
+        size: e.size.clone().unwrap_or_default(),
+        extra,
+        parts: Vec::new(),
+    }
+}
+
+fn human_size(n: u64) -> String {
+    if n == 0 {
+        return String::new();
+    }
+    const UNIT: f64 = 1024.0;
+    let mut v = n as f64;
+    let mut exp = 0;
+    while v >= UNIT && exp < 5 {
+        v /= UNIT;
+        exp += 1;
+    }
+    if exp == 0 {
+        format!("{n} B")
+    } else {
+        format!("{v:.1} {}B", ['K', 'M', 'G', 'T', 'P'][exp - 1])
+    }
 }
 
 fn json_str(v: &Value) -> String {

@@ -1,5 +1,8 @@
 use clap::{Parser, Subcommand};
-use lanzou_share::{is_upload_allowed_ext, Account, Client, EntryKind, Error, ListEntry, ParseOptions};
+use lanzou_share::{
+    config_keys, config_path_used, get_config, get_config_value, is_upload_allowed_ext, save_config,
+    set_config_value, unescape_list, Account, Client, EntryKind, Error, ListEntry, ParseOptions,
+};
 use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -91,6 +94,9 @@ enum Commands {
     List {
         #[arg(long = "folder", default_value = "-1")]
         folder: String,
+        /// Disable list_unescape grouping
+        #[arg(long = "raw")]
+        raw: bool,
         #[arg(short = 'u', long = "user", env = "LANZOU_USER")]
         user: Option<String>,
         #[arg(long = "pass", env = "LANZOU_PASS")]
@@ -199,6 +205,15 @@ enum Commands {
         #[arg(short = 'j', long = "jobs", default_value_t = 3)]
         jobs: usize,
     },
+    /// Get/set config (stored in ~/.lanzou/config.json)
+    Config {
+        /// list | get | set | path | reset
+        action: Option<String>,
+        /// key for get/set, or key for bare `config KEY VALUE`
+        key: Option<String>,
+        /// value for set
+        value: Option<String>,
+    },
 }
 
 fn cookie_or_default(c: Option<PathBuf>) -> PathBuf {
@@ -251,10 +266,11 @@ fn main() -> ExitCode {
         }
         Some(Commands::List {
             folder,
+            raw,
             user,
             pass,
             cookie,
-        }) => cmd_list(folder, user, pass, cookie_or_default(cookie)),
+        }) => cmd_list(folder, raw, user, pass, cookie_or_default(cookie)),
         Some(Commands::Upload {
             file,
             folder,
@@ -326,6 +342,7 @@ fn main() -> ExitCode {
             output_dir,
             jobs,
         }) => cmd_interactive(user, pass, cookie, output_dir, jobs),
+        Some(Commands::Config { action, key, value }) => cmd_config(action, key, value),
     }
 }
 
@@ -472,20 +489,48 @@ fn cmd_login(
     ExitCode::SUCCESS
 }
 
-fn print_list(folder: &str, list: &[ListEntry]) {
-    println!("folder={folder}  entries={}", list.len());
-    for e in list {
-        let kind = match e.kind {
-            EntryKind::Folder => "DIR ",
-            EntryKind::File => "FILE",
+fn print_list(acc: &Account, folder: &str, list: &[ListEntry], unescape: bool) {
+    let cfg = get_config();
+    let do_unescape = unescape && cfg.list_unescape;
+    let notes = if do_unescape {
+        acc.fetch_notes(list)
+    } else {
+        Default::default()
+    };
+    let rows = unescape_list(list, &notes, do_unescape);
+    print!("folder={folder}  entries={}", list.len());
+    if do_unescape && rows.len() != list.len() {
+        print!("  display={}", rows.len());
+    }
+    println!();
+    for e in rows {
+        let kind = match e.kind.as_str() {
+            "DIR" => "DIR ",
+            "SPLIT" => "SPLIT",
+            _ => "FILE",
         };
-        let extra = e.size.clone().or_else(|| e.url.clone()).unwrap_or_default();
+        let extra = if e.extra.is_empty() {
+            e.size.clone()
+        } else {
+            e.extra.clone()
+        };
         println!("  [{kind}] id={:<12}  {}  {}", e.id, e.name, extra);
+        if e.kind == "SPLIT" {
+            for p in e.parts {
+                println!(
+                    "           └─ id={:<12}  {}  {}",
+                    p.id,
+                    p.name,
+                    p.size.unwrap_or_default()
+                );
+            }
+        }
     }
 }
 
 fn cmd_list(
     folder: String,
+    raw: bool,
     user: Option<String>,
     pass: Option<String>,
     cookie: PathBuf,
@@ -496,7 +541,7 @@ fn cmd_list(
     };
     match acc.list(&folder) {
         Ok(list) => {
-            print_list(&folder, &list);
+            print_list(&acc, &folder, &list, !raw);
             ExitCode::SUCCESS
         }
         Err(e) => {
@@ -519,17 +564,51 @@ fn cmd_upload(
         Ok(a) => a,
         Err(c) => return c,
     };
+    let cfg = get_config();
     println!("[upload] {} -> folder {folder}", file.display());
     if let Some(ext) = file.extension().and_then(|s| s.to_str()) {
         if !is_upload_allowed_ext(ext) {
-            println!("[upload] suffix .{ext} not allowed by server, will pack as .zip");
+            if cfg.suffix_auto_convert {
+                println!(
+                    "[upload] suffix .{ext} not allowed; convert mode={} -> .{}",
+                    cfg.suffix_mode, cfg.suffix_name
+                );
+            } else {
+                println!("[upload] suffix .{ext} not allowed (suffix_auto_convert=false)");
+            }
+        }
+    }
+    if let Ok(meta) = std::fs::metadata(&file) {
+        let limit = (cfg.split_size_mb as u64) * 1024 * 1024;
+        if cfg.split_enable && meta.len() > limit {
+            println!(
+                "[upload] size {} > {}MB, will split (format={})",
+                meta.len(),
+                cfg.split_size_mb,
+                cfg.split_name_format
+            );
         }
     }
     match acc.upload(&file, &folder) {
         Ok(res) => {
-            println!("[ok] uploaded");
-            println!("  file_id: {}", res.file_id);
-            println!("  name:    {}", res.name);
+            if !res.parts.is_empty() {
+                println!(
+                    "[ok] uploaded {} parts  group={}  orig={}",
+                    res.parts.len(),
+                    res.group_id.as_deref().unwrap_or(""),
+                    res.orig_name.as_deref().unwrap_or("")
+                );
+                for p in &res.parts {
+                    println!(
+                        "  part {}/{} id={} name={} size={}",
+                        p.index, p.total, p.file_id, p.name, p.size
+                    );
+                }
+            } else {
+                println!("[ok] uploaded");
+                println!("  file_id: {}", res.file_id);
+                println!("  name:    {}", res.name);
+            }
             if let Some(pwd) = set_pwd {
                 if !res.file_id.is_empty() {
                     if let Err(e) = acc.set_file_password(&res.file_id, &pwd) {
@@ -540,7 +619,7 @@ fn cmd_upload(
                 }
             }
             if let Some(desc) = set_desc {
-                if !res.file_id.is_empty() {
+                if !res.file_id.is_empty() && res.parts.is_empty() {
                     if let Err(e) = acc.set_file_describe(&res.file_id, &desc) {
                         eprintln!("[warn] set desc: {e}");
                     } else {
@@ -548,7 +627,7 @@ fn cmd_upload(
                     }
                 }
             }
-            if !res.file_id.is_empty() {
+            if !res.file_id.is_empty() && res.parts.is_empty() {
                 if let Ok((share, pwd)) = acc.get_file_download_info(&res.file_id) {
                     println!("  share:   {share}");
                     if !pwd.is_empty() {
@@ -561,6 +640,106 @@ fn cmd_upload(
         Err(e) => {
             eprintln!("[error] {e}");
             ExitCode::from(1)
+        }
+    }
+}
+
+fn cmd_config(action: Option<String>, key: Option<String>, value: Option<String>) -> ExitCode {
+    let act = action.as_deref().unwrap_or("list");
+    match act {
+        "list" | "show" | "ls" => {
+            let cfg = get_config();
+            println!("config: {}", config_path_used().display());
+            for (k, desc) in config_keys() {
+                let v = get_config_value(&cfg, k).unwrap_or_default();
+                println!("  {k:<20} = {v:<10}  # {desc}");
+            }
+            ExitCode::SUCCESS
+        }
+        "get" => {
+            let Some(k) = key else {
+                eprintln!("usage: lanzou config get <key>");
+                return ExitCode::from(1);
+            };
+            match get_config_value(&get_config(), &k) {
+                Ok(v) => {
+                    println!("{v}");
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("[error] {e}");
+                    ExitCode::from(1)
+                }
+            }
+        }
+        "set" => {
+            let (Some(k), Some(v)) = (key, value) else {
+                eprintln!("usage: lanzou config set <key> <value>");
+                return ExitCode::from(1);
+            };
+            match set_config_value(get_config(), &k, &v) {
+                Ok(cfg) => {
+                    if let Err(e) = save_config(config_path_used(), cfg.clone()) {
+                        eprintln!("[error] save: {e}");
+                        return ExitCode::from(1);
+                    }
+                    let nv = get_config_value(&cfg, &k).unwrap_or_default();
+                    println!("[ok] {k} = {nv}");
+                    println!("  saved: {}", config_path_used().display());
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("[error] {e}");
+                    ExitCode::from(1)
+                }
+            }
+        }
+        "path" => {
+            println!("{}", config_path_used().display());
+            ExitCode::SUCCESS
+        }
+        "reset" => {
+            let cfg = lanzou_share::Config::default();
+            if let Err(e) = save_config(config_path_used(), cfg) {
+                eprintln!("[error] {e}");
+                return ExitCode::from(1);
+            }
+            println!("[ok] reset to defaults -> {}", config_path_used().display());
+            ExitCode::SUCCESS
+        }
+        "help" | "-h" | "--help" => {
+            println!("lanzou config list");
+            println!("lanzou config get <key>");
+            println!("lanzou config set <key> <value>");
+            println!("lanzou config path");
+            println!("lanzou config reset");
+            for (k, d) in config_keys() {
+                println!("  {k:<20}  {d}");
+            }
+            ExitCode::SUCCESS
+        }
+        other => {
+            // bare: config KEY VALUE
+            if let Some(v) = key {
+                match set_config_value(get_config(), other, &v) {
+                    Ok(cfg) => {
+                        if let Err(e) = save_config(config_path_used(), cfg.clone()) {
+                            eprintln!("[error] save: {e}");
+                            return ExitCode::from(1);
+                        }
+                        let nv = get_config_value(&cfg, other).unwrap_or_default();
+                        println!("[ok] {other} = {nv}");
+                        ExitCode::SUCCESS
+                    }
+                    Err(e) => {
+                        eprintln!("[error] {e}");
+                        ExitCode::from(1)
+                    }
+                }
+            } else {
+                eprintln!("unknown config subcommand: {other}");
+                ExitCode::from(1)
+            }
         }
     }
 }
@@ -1038,7 +1217,7 @@ impl Shell {
             }
             "ls" | "ll" | "list" => {
                 let list = self.acc.list(&self.folder).map_err(|e| e.to_string())?;
-                print_list(&self.folder, &list);
+                print_list(&self.acc, &self.folder, &list, true);
                 Ok(false)
             }
             "cd" => {

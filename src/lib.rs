@@ -5,12 +5,19 @@
 
 mod account;
 mod acw;
+mod config;
 mod error;
 
 pub use account::{
-    is_upload_allowed_ext, Account, EntryKind, FileInfo, FolderInfo, ListEntry, UploadResult,
+    is_upload_allowed_ext, unescape_list, Account, DisplayEntry, EntryKind, FileInfo, FolderInfo,
+    ListEntry, UploadPart, UploadResult,
 };
 pub use acw::{calc_acw_sc_v2, extract_arg1, is_acw_challenge, solve_from_html, MASK, PERM};
+pub use config::{
+    config_keys, config_path_used, default_config_path, format_part_note, format_split_name,
+    get_config, get_config_value, load_config, parse_part_note, save_config, set_config_cache,
+    set_config_value, Config, PartMeta,
+};
 pub use error::{Error, Result};
 
 use regex::Regex;
