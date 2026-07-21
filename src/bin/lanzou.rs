@@ -61,6 +61,7 @@ struct Cli {
 #[derive(Subcommand, Debug)]
 enum Commands {
     /// Parse a share URL (default when URL is given)
+    #[command(visible_alias = "get", visible_alias = "p")]
     Parse {
         url: String,
         #[arg(short = 'p', long = "pwd")]
@@ -75,6 +76,7 @@ enum Commands {
         no_resolve: bool,
     },
     /// Login and save cookie
+    #[command(visible_alias = "signin", visible_alias = "auth")]
     Login {
         #[arg(short = 'u', long = "user", env = "LANZOU_USER")]
         user: Option<String>,
@@ -86,11 +88,13 @@ enum Commands {
         cookie: Option<PathBuf>,
     },
     /// Remove cookie file
+    #[command(visible_alias = "signout")]
     Logout {
         #[arg(short = 'c', long = "cookie", env = "LANZOU_COOKIE")]
         cookie: Option<PathBuf>,
     },
     /// List folder entries
+    #[command(visible_alias = "ls", visible_alias = "ll", visible_alias = "dir")]
     List {
         #[arg(long = "folder", default_value = "-1")]
         folder: String,
@@ -105,6 +109,7 @@ enum Commands {
         cookie: Option<PathBuf>,
     },
     /// Upload a local file
+    #[command(visible_alias = "up", visible_alias = "put")]
     Upload {
         file: PathBuf,
         #[arg(long = "folder", default_value = "-1")]
@@ -121,6 +126,7 @@ enum Commands {
         cookie: Option<PathBuf>,
     },
     /// Create folder
+    #[command(visible_alias = "md")]
     Mkdir {
         name: String,
         #[arg(long = "folder", default_value = "-1")]
@@ -135,6 +141,7 @@ enum Commands {
         cookie: Option<PathBuf>,
     },
     /// Delete file or folder
+    #[command(visible_alias = "delete", visible_alias = "del", visible_alias = "remove", visible_alias = "unlink")]
     Rm {
         #[arg(long = "file")]
         file: Option<String>,
@@ -148,6 +155,7 @@ enum Commands {
         cookie: Option<PathBuf>,
     },
     /// Show file/folder info
+    #[command(visible_alias = "show", visible_alias = "stat")]
     Info {
         #[arg(long = "file")]
         file: Option<String>,
@@ -161,6 +169,7 @@ enum Commands {
         cookie: Option<PathBuf>,
     },
     /// Set share password
+    #[command(visible_alias = "password", visible_alias = "pwdset")]
     Passwd {
         #[arg(long = "file")]
         file: Option<String>,
@@ -176,6 +185,7 @@ enum Commands {
         cookie: Option<PathBuf>,
     },
     /// Download file (via share info) or folder (recursive, concurrent)
+    #[command(visible_alias = "dl", visible_alias = "down", visible_alias = "fetch")]
     Download {
         /// File/folder id or name in current folder
         target: String,
@@ -193,6 +203,7 @@ enum Commands {
         cookie: Option<PathBuf>,
     },
     /// Interactive shell
+    #[command(visible_alias = "i", visible_alias = "shell", visible_alias = "sh", visible_alias = "repl")]
     Interactive {
         #[arg(short = 'u', long = "user", env = "LANZOU_USER")]
         user: Option<String>,
@@ -206,6 +217,7 @@ enum Commands {
         jobs: usize,
     },
     /// Get/set config (stored in ~/.lanzou/config.json)
+    #[command(visible_alias = "conf", visible_alias = "cfg", visible_alias = "settings")]
     Config {
         /// list | get | set | path | reset
         action: Option<String>,
@@ -1205,9 +1217,12 @@ impl Shell {
         let args = &parts[1..];
         match cmd {
             "help" | "?" => {
-                println!("ls | cd <id|name|/|..> | pwd | download <id|name> [-j N] [-o DIR]");
-                println!("info <id|name> | upload <path> | mkdir <name> | rm <id|name>");
-                println!("login [--user U --pass P] | logout | exit");
+                println!("ls|ll|list|dir | cd <id|name|/|..> | pwd");
+                println!("download|dl|down|fetch <id|name> [-j N] [-o DIR]");
+                println!("info|show|stat <id|name> | upload|up|put <path>");
+                println!("mkdir|md <name> | rm|delete|del|remove <id|name>");
+                println!("login|signin [--user U --pass P] | logout|signout");
+                println!("config|conf|cfg [list|get|set ...] | exit|quit|q");
                 Ok(false)
             }
             "exit" | "quit" | "q" => Ok(true),
@@ -1215,7 +1230,7 @@ impl Shell {
                 println!("{}", self.folder);
                 Ok(false)
             }
-            "ls" | "ll" | "list" => {
+            "ls" | "ll" | "list" | "dir" => {
                 let list = self.acc.list(&self.folder).map_err(|e| e.to_string())?;
                 print_list(&self.acc, &self.folder, &list, true);
                 Ok(false)
@@ -1227,18 +1242,18 @@ impl Shell {
                 self.cd(&args[0])?;
                 Ok(false)
             }
-            "download" | "dl" | "get" => {
+            "download" | "dl" | "down" | "fetch" | "get" => {
                 self.cmd_download(args)?;
                 Ok(false)
             }
-            "info" => {
+            "info" | "show" | "stat" => {
                 if args.is_empty() {
                     return Err("usage: info <id|name>".into());
                 }
                 self.cmd_info(&args[0])?;
                 Ok(false)
             }
-            "upload" | "up" => {
+            "upload" | "up" | "put" => {
                 if args.is_empty() {
                     return Err("usage: upload <local-path>".into());
                 }
@@ -1249,7 +1264,7 @@ impl Shell {
                 println!("[ok] uploaded {} {}", res.file_id, res.name);
                 Ok(false)
             }
-            "mkdir" => {
+            "mkdir" | "md" => {
                 if args.is_empty() {
                     return Err("usage: mkdir <name>".into());
                 }
@@ -1259,21 +1274,28 @@ impl Shell {
                 println!("[ok] mkdir {}", args[0]);
                 Ok(false)
             }
-            "rm" | "delete" => {
+            "rm" | "delete" | "del" | "remove" | "unlink" => {
                 if args.is_empty() {
                     return Err("usage: rm <id|name>".into());
                 }
                 self.cmd_rm(&args[0])?;
                 Ok(false)
             }
-            "login" => {
+            "login" | "signin" | "auth" => {
                 self.cmd_login(args)?;
                 Ok(false)
             }
-            "logout" => {
+            "logout" | "signout" => {
                 let _ = std::fs::remove_file(&self.cookie);
                 let _ = self.acc.set_cookie("");
                 println!("[ok] logged out");
+                Ok(false)
+            }
+            "config" | "conf" | "cfg" | "settings" => {
+                let action = args.first().cloned();
+                let key = args.get(1).cloned();
+                let value = args.get(2).cloned();
+                let _ = cmd_config(action, key, value);
                 Ok(false)
             }
             _ => Err(format!("unknown command: {cmd} (help for list)")),
