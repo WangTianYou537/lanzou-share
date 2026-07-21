@@ -7,6 +7,7 @@ mod account;
 mod acw;
 mod config;
 mod error;
+mod notes;
 
 pub use account::{
     is_upload_allowed_ext, unescape_list, Account, DisplayEntry, EntryKind, FileInfo, FolderInfo,
@@ -14,10 +15,12 @@ pub use account::{
 };
 pub use acw::{calc_acw_sc_v2, extract_arg1, is_acw_challenge, solve_from_html, MASK, PERM};
 pub use config::{
-    config_keys, config_path_used, default_config_path, format_convert_note, format_part_note,
-    format_split_name, get_config, get_config_value, load_config, parse_convert_note,
-    parse_part_note, save_config, set_config_cache, set_config_value, Config, ConvertMeta,
-    PartMeta,
+    config_keys, config_path_used, default_config_path, format_split_name, get_config,
+    get_config_value, load_config, save_config, set_config_cache, set_config_value, Config,
+};
+pub use notes::{
+    format_convert_note, format_part_note, parse_convert_note, parse_file_note, parse_part_note,
+    ConvertMeta, FileNote, PartMeta,
 };
 /// Crate / CLI version (from Cargo.toml).
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

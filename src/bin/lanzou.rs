@@ -145,10 +145,15 @@ enum Commands {
     /// Delete file or folder
     #[command(visible_alias = "delete", visible_alias = "del", visible_alias = "remove", visible_alias = "unlink")]
     Rm {
+        /// id or original name (via notes); optional if --file/--folder given
+        target: Option<String>,
         #[arg(long = "file")]
         file: Option<String>,
         #[arg(long = "folder")]
         folder: Option<String>,
+        /// folder context for name resolution
+        #[arg(long = "in", default_value = "-1")]
+        in_folder: String,
         #[arg(short = 'u', long = "user", env = "LANZOU_USER")]
         user: Option<String>,
         #[arg(long = "pass", env = "LANZOU_PASS")]
@@ -311,12 +316,14 @@ fn main() -> ExitCode {
             cookie,
         }) => cmd_mkdir(name, folder, desc, user, pass, cookie_or_default(cookie)),
         Some(Commands::Rm {
+            target,
             file,
             folder,
+            in_folder,
             user,
             pass,
             cookie,
-        }) => cmd_rm(file, folder, user, pass, cookie_or_default(cookie)),
+        }) => cmd_rm(target, file, folder, in_folder, user, pass, cookie_or_default(cookie)),
         Some(Commands::Info {
             file,
             folder,
@@ -783,9 +790,81 @@ fn cmd_mkdir(
     }
 }
 
+fn delete_target(acc: &Account, cur_folder: &str, target: &str) -> Result<(), String> {
+    let list = acc.list(cur_folder).map_err(|e| e.to_string())?;
+    let notes = acc.fetch_notes(&list);
+    if let Some(r) = resolve_by_notes(&list, &notes, target) {
+        if r.kind == "split" {
+            println!("[rm] split {}  parts={}", r.orig_name, r.parts.len());
+            let mut failed = 0usize;
+            for p in &r.parts {
+                if let Err(e) = acc.delete_file(&p.file_id) {
+                    failed += 1;
+                    eprintln!(
+                        "[warn] delete part {} id={}: {e}",
+                        p.index, p.file_id
+                    );
+                } else {
+                    println!(
+                        "[ok] deleted part {}/{} id={} {}",
+                        p.index, p.total, p.file_id, p.name
+                    );
+                }
+            }
+            if failed > 0 {
+                return Err(format!("{failed}/{} parts failed to delete", r.parts.len()));
+            }
+            return Ok(());
+        }
+        acc.delete_file(&r.file_id).map_err(|e| e.to_string())?;
+        println!(
+            "[ok] deleted {} (id={} remote via convert note)",
+            r.orig_name, r.file_id
+        );
+        return Ok(());
+    }
+    if let Some(e) = resolve_entry(&list, target) {
+        match e.kind {
+            EntryKind::File => {
+                if let Some(note) = notes.get(&e.id) {
+                    if let Some(pm) = parse_part_note(note) {
+                        let name = if pm.name.is_empty() {
+                            pm.group_id
+                        } else {
+                            pm.name
+                        };
+                        return delete_target(acc, cur_folder, &name);
+                    }
+                }
+                acc.delete_file(&e.id).map_err(|e| e.to_string())?;
+                println!("[ok] deleted file {} ({})", e.name, e.id);
+                return Ok(());
+            }
+            EntryKind::Folder => {
+                acc.delete_folder(&e.id).map_err(|e| e.to_string())?;
+                println!("[ok] deleted folder {} ({})", e.name, e.id);
+                return Ok(());
+            }
+        }
+    }
+    if is_digits(target) {
+        if acc.delete_file(target).is_ok() {
+            println!("[ok] deleted file {target}");
+            return Ok(());
+        }
+        if acc.delete_folder(target).is_ok() {
+            println!("[ok] deleted folder {target}");
+            return Ok(());
+        }
+    }
+    Err(format!("not found in folder {cur_folder}: {target}"))
+}
+
 fn cmd_rm(
+    target: Option<String>,
     file: Option<String>,
     folder: Option<String>,
+    in_folder: String,
     user: Option<String>,
     pass: Option<String>,
     cookie: PathBuf,
@@ -794,12 +873,22 @@ fn cmd_rm(
         Ok(a) => a,
         Err(c) => return c,
     };
+    if let Some(t) = target {
+        return match delete_target(&acc, &in_folder, &t) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("[error] {e}");
+                ExitCode::from(1)
+            }
+        };
+    }
     let res = if let Some(id) = file {
         acc.delete_file(&id)
     } else if let Some(id) = folder {
         acc.delete_folder(&id)
     } else {
-        eprintln!("usage: lanzou rm --file ID | --folder ID");
+        eprintln!("usage: lanzou rm <id|name> [--in folderID]");
+        eprintln!("   or: lanzou rm --file ID | --folder ID");
         return ExitCode::from(1);
     };
     match res {
@@ -1679,18 +1768,7 @@ impl Shell {
     }
 
     fn cmd_rm(&self, target: &str) -> Result<(), String> {
-        let list = self.acc.list(&self.folder).map_err(|e| e.to_string())?;
-        let e = resolve_entry(&list, target).ok_or_else(|| format!("not found: {target}"))?;
-        match e.kind {
-            EntryKind::File => {
-                self.acc.delete_file(&e.id).map_err(|e| e.to_string())?;
-            }
-            EntryKind::Folder => {
-                self.acc.delete_folder(&e.id).map_err(|e| e.to_string())?;
-            }
-        }
-        println!("[ok] deleted {} {}", e.name, e.id);
-        Ok(())
+        delete_target(&self.acc, &self.folder, target)
     }
 
     fn cmd_login(&mut self, args: &[String]) -> Result<(), String> {

@@ -673,7 +673,7 @@ impl Account {
             res.orig_name = Some(orig_name.clone());
             // Record original name when suffix was converted.
             if !res.file_id.is_empty() && up_name != orig_name {
-                let note = crate::config::format_convert_note(
+                let note = crate::notes::format_convert_note(
                     &orig_name,
                     &up_name,
                     &cfg.suffix_mode,
@@ -757,7 +757,7 @@ impl Account {
                 .upload_one(&up_path, &up_name, folder_id)
                 .map_err(|e| Error::Parse(format!("upload part {index}/{total}: {e}")))?;
             if cfg.split_note && !res.file_id.is_empty() {
-                let note = crate::config::format_part_note(
+                let note = crate::notes::format_part_note(
                     &group_id,
                     orig_name,
                     index,
@@ -983,7 +983,7 @@ pub fn unescape_list(
         return out;
     }
     use std::collections::BTreeMap;
-    let mut groups: BTreeMap<String, (crate::config::PartMeta, Vec<ListEntry>)> = BTreeMap::new();
+    let mut groups: BTreeMap<String, (crate::notes::PartMeta, Vec<ListEntry>)> = BTreeMap::new();
     let mut plain: Vec<ListEntry> = Vec::new();
     for e in list {
         if e.kind == EntryKind::Folder {
@@ -995,7 +995,7 @@ pub fn unescape_list(
             .cloned()
             .or_else(|| e.description.clone())
             .unwrap_or_default();
-        if let Some(meta) = crate::config::parse_part_note(&note) {
+        if let Some(meta) = crate::notes::parse_part_note(&note) {
             let ent = groups
                 .entry(meta.group_id.clone())
                 .or_insert_with(|| (meta.clone(), Vec::new()));
@@ -1019,7 +1019,7 @@ pub fn unescape_list(
                 .cloned()
                 .or_else(|| p.description.clone())
                 .unwrap_or_default();
-            crate::config::parse_part_note(&n)
+            crate::notes::parse_part_note(&n)
                 .map(|m| m.index)
                 .unwrap_or(0)
         });
@@ -1038,7 +1038,7 @@ pub fn unescape_list(
                 .cloned()
                 .or_else(|| p.description.clone())
                 .unwrap_or_default();
-            if let Some(m) = crate::config::parse_part_note(&n) {
+            if let Some(m) = crate::notes::parse_part_note(&n) {
                 total_size += m.size;
             }
         }
@@ -1083,7 +1083,7 @@ fn apply_convert_notes(rows: &mut [DisplayEntry], notes: &HashMap<String, String
             continue;
         }
         let note = notes.get(&row.id).cloned().unwrap_or_default();
-        let Some(cm) = crate::config::parse_convert_note(&note) else {
+        let Some(cm) = crate::notes::parse_convert_note(&note) else {
             continue;
         };
         if cm.name.is_empty() {
