@@ -19,8 +19,8 @@ pub use config::{
     get_config_value, load_config, save_config, set_config_cache, set_config_value, Config,
 };
 pub use notes::{
-    format_convert_note, format_part_note, parse_convert_note, parse_file_note, parse_part_note,
-    ConvertMeta, FileNote, PartMeta,
+    format_convert_note, format_part_note, format_raw_note, parse_convert_note, parse_file_note,
+    parse_part_note, ConvertMeta, FileNote, PartMeta, NOTE_VERSION,
 };
 /// Crate / CLI version (from Cargo.toml).
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

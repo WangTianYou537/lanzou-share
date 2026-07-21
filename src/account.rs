@@ -671,17 +671,21 @@ impl Account {
             }
             let mut res = self.upload_one(&up_path, &up_name, folder_id)?;
             res.orig_name = Some(orig_name.clone());
-            // Record original name when suffix was converted.
-            if !res.file_id.is_empty() && up_name != orig_name {
-                let note = crate::notes::format_convert_note(
-                    &orig_name,
-                    &up_name,
-                    &cfg.suffix_mode,
-                    &cfg.suffix_name,
-                    size,
-                );
+            // Always write JSON note (raw or convert).
+            if !res.file_id.is_empty() {
+                let note = if up_name != orig_name {
+                    crate::notes::format_convert_note(
+                        &orig_name,
+                        &up_name,
+                        &cfg.suffix_mode,
+                        &cfg.suffix_name,
+                        size,
+                    )
+                } else {
+                    crate::notes::format_raw_note(&orig_name, &up_name, size)
+                };
                 if let Err(e) = self.set_file_describe(&res.file_id, &note) {
-                    eprintln!("[warn] set convert note: {e}");
+                    eprintln!("[warn] set note: {e}");
                 }
             }
             return Ok(res);
@@ -756,10 +760,12 @@ impl Account {
             let res = self
                 .upload_one(&up_path, &up_name, folder_id)
                 .map_err(|e| Error::Parse(format!("upload part {index}/{total}: {e}")))?;
-            if cfg.split_note && !res.file_id.is_empty() {
+            // Always write part JSON note.
+            if !res.file_id.is_empty() {
                 let note = crate::notes::format_part_note(
                     &group_id,
                     orig_name,
+                    &up_name,
                     index,
                     total,
                     sizes[i],
@@ -1095,6 +1101,9 @@ fn apply_convert_notes(rows: &mut [DisplayEntry], notes: &HashMap<String, String
             cm.as_name.clone()
         };
         row.name = cm.name;
+        if cm.raw {
+            continue;
+        }
         let hint = format!("as={} mode={}", as_name, cm.mode);
         if row.extra.is_empty() {
             row.extra = hint;
