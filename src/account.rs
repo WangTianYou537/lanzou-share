@@ -9,13 +9,102 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::fs;
 use std::fs::File;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 const DEFAULT_ACCOUNT_BASE: &str = "https://pc.woozooo.com/";
 const DEFAULT_UA: &str =
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
+/// Lanzou HTML5 upload size limit (server-side).
+const MAX_UPLOAD_BYTES: u64 = 100 * 1024 * 1024;
+
+/// Server-side suffix whitelist for `html5up.php`.
+const UPLOAD_ALLOWED_EXTS: &[&str] = &[
+    "doc", "docx", "zip", "rar", "apk", "txt", "exe", "7z", "e", "z", "ct", "ke",
+    "cetrainer", "db", "tar", "pdf", "w3x", "epub", "mobi", "azw", "azw3", "osk",
+    "osz", "xpa", "cpk", "lua", "jar", "dmg", "ppt", "pptx", "xls", "xlsx", "mp3",
+    "ipa", "iso", "img", "gho", "ttf", "ttc", "txf", "dwg", "bat", "imazingapp",
+    "dll", "crx", "xapk", "conf", "deb", "rp", "rpm", "rplib", "mobileconfig",
+    "appimage", "lolgezi", "flac", "cad", "hwt", "accdb", "ce", "xmind", "enc",
+    "bds", "bdi", "ssf", "it", "pkg", "cfg", "mp4", "avi", "png", "jpeg", "jpg",
+    "gif", "webp", "brushset",
+];
+
+/// Whether `ext` (with or without leading `.`) is accepted by html5up.php.
+pub fn is_upload_allowed_ext(ext: &str) -> bool {
+    let ext = ext.trim().trim_start_matches('.').to_ascii_lowercase();
+    !ext.is_empty() && UPLOAD_ALLOWED_EXTS.iter().any(|e| *e == ext)
+}
+
+fn file_ext(name: &str) -> String {
+    Path::new(name)
+        .extension()
+        .and_then(|s| s.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase()
+}
+
+fn zip_single_file(src: &Path) -> Result<(PathBuf, String)> {
+    let base = src
+        .file_name()
+        .and_then(|s| s.to_str())
+        .ok_or_else(|| Error::Parse("invalid filename".into()))?
+        .to_string();
+    let zip_name = format!("{base}.zip");
+    let tmp = std::env::temp_dir().join(format!(
+        "lanzou-up-{}-{zip_name}",
+        std::process::id()
+    ));
+    let file = File::create(&tmp)?;
+    let mut zip = zip::ZipWriter::new(file);
+    let opts: zip::write::FileOptions<'_, ()> =
+        zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+    zip.start_file(&base, opts)
+        .map_err(|e| Error::Parse(format!("zip start: {e}")))?;
+    let mut src_f = File::open(src)?;
+    let mut buf = Vec::new();
+    src_f.read_to_end(&mut buf)?;
+    zip.write_all(&buf)
+        .map_err(|e| Error::Parse(format!("zip write: {e}")))?;
+    zip.finish()
+        .map_err(|e| Error::Parse(format!("zip finish: {e}")))?;
+    Ok((tmp, zip_name))
+}
+
+/// Validate size/ext; auto-zip unsupported suffixes. Returns (path, upload_name, temp_to_remove).
+fn prepare_upload_path(local_path: &Path) -> Result<(PathBuf, String, Option<PathBuf>)> {
+    let meta = fs::metadata(local_path)?;
+    if !meta.is_file() {
+        return Err(Error::Parse(format!("not a file: {}", local_path.display())));
+    }
+    if meta.len() > MAX_UPLOAD_BYTES {
+        return Err(Error::Parse(format!(
+            "file too large: {} bytes (max {} MB)",
+            meta.len(),
+            MAX_UPLOAD_BYTES / (1024 * 1024)
+        )));
+    }
+    let name = local_path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .ok_or_else(|| Error::Parse("invalid filename".into()))?
+        .to_string();
+    if is_upload_allowed_ext(&file_ext(&name)) {
+        return Ok((local_path.to_path_buf(), name, None));
+    }
+    let (zp, zn) = zip_single_file(local_path)?;
+    let zmeta = fs::metadata(&zp)?;
+    if zmeta.len() > MAX_UPLOAD_BYTES {
+        let _ = fs::remove_file(&zp);
+        return Err(Error::Parse(format!(
+            "zipped file too large: {} bytes (max {} MB)",
+            zmeta.len(),
+            MAX_UPLOAD_BYTES / (1024 * 1024)
+        )));
+    }
+    Ok((zp.clone(), zn, Some(zp)))
+}
 
 /// Entry type: folder or file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -457,17 +546,14 @@ impl Account {
     /// POST https://pc.woozooo.com/html5up.php
     /// multipart: task=1, folder_id=<id>, upload_file=@file
     /// ```
+    ///
+    /// Server limits: max 100MB; restricted suffix whitelist. Unsupported
+    /// suffixes (e.g. `.dex`) are automatically packed into a `.zip`.
     pub fn upload(&self, local_path: impl AsRef<Path>, folder_id: &str) -> Result<UploadResult> {
         let local_path = local_path.as_ref();
         let folder_id = if folder_id.is_empty() { "-1" } else { folder_id };
-        if !local_path.is_file() {
-            return Err(Error::Parse(format!("not a file: {}", local_path.display())));
-        }
-        let filename = local_path
-            .file_name()
-            .and_then(|s| s.to_str())
-            .ok_or_else(|| Error::Parse("invalid filename".into()))?
-            .to_string();
+        let (upload_path, filename, temp) = prepare_upload_path(local_path)?;
+        let _guard = TempGuard(temp);
 
         let mut urls = vec![format!("{}html5up.php", self.base)];
         if self.base.contains("up.woozooo.com") {
@@ -478,7 +564,7 @@ impl Account {
 
         let mut last_err = Error::Http("upload failed".into());
         for up_url in urls {
-            let mut file = File::open(local_path)?;
+            let mut file = File::open(&upload_path)?;
             let mut buf = Vec::new();
             file.read_to_end(&mut buf)?;
             let part = Part::bytes(buf)
@@ -573,6 +659,16 @@ impl Account {
             });
         }
         Err(last_err)
+    }
+}
+
+/// Removes a temporary upload zip on drop.
+struct TempGuard(Option<PathBuf>);
+impl Drop for TempGuard {
+    fn drop(&mut self) {
+        if let Some(p) = self.0.take() {
+            let _ = fs::remove_file(p);
+        }
     }
 }
 

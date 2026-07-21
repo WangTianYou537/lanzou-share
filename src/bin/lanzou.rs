@@ -1,5 +1,5 @@
 use clap::{Parser, Subcommand};
-use lanzou_share::{Account, Client, EntryKind, Error, ListEntry, ParseOptions};
+use lanzou_share::{is_upload_allowed_ext, Account, Client, EntryKind, Error, ListEntry, ParseOptions};
 use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -520,6 +520,11 @@ fn cmd_upload(
         Err(c) => return c,
     };
     println!("[upload] {} -> folder {folder}", file.display());
+    if let Some(ext) = file.extension().and_then(|s| s.to_str()) {
+        if !is_upload_allowed_ext(ext) {
+            println!("[upload] suffix .{ext} not allowed by server, will pack as .zip");
+        }
+    }
     match acc.upload(&file, &folder) {
         Ok(res) => {
             println!("[ok] uploaded");

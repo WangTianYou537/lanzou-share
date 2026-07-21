@@ -1,6 +1,6 @@
 [package]
 name = "lanzou-share"
-version = "0.2.2"
+version = "0.2.3"
 edition = "2021"
 rust-version = "1.70"
 description = "Lanzou (蓝奏云) share resolver + account manager (login/folder/file) with acw_sc__v2 bypass"
@@ -22,6 +22,7 @@ serde_json = "1"
 thiserror = "1"
 url = "2"
 urlencoding = "2"
+zip = { version = "2", default-features = false, features = ["deflate"] }
 clap = { version = "4", features = ["derive", "env"], optional = true }
 
 [features]
