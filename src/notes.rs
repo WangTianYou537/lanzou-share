@@ -6,7 +6,8 @@
 //! {"v":2,"kind":"part","id":"...","name":"big.bin","as":"big_s001.zip","index":1,"total":3,"size":1048576,
 //!  "nextId":"123","nextUrl":"https://.../xxx","npwd":"ab12"}
 //!
-//! Part chain: v1 `next` is file id; v2 uses `nextId` + `nextUrl` (+ `npwd`).
+//! Part chain: v1 `next` is always a file id; v2 uses `nextId` + `nextUrl` (+ `npwd`).
+//! Never treat v1 `next` as a URL.
 //! ```
 
 use serde::{Deserialize, Serialize};
@@ -217,23 +218,10 @@ fn html_unescape(s: &str) -> String {
 }
 
 
-fn looks_like_share_url(s: &str) -> bool {
-    let s = s.trim();
-    if s.is_empty() {
-        return false;
-    }
-    if s.starts_with("http://") || s.starts_with("https://") || s.starts_with("//") {
-        return true;
-    }
-    s.contains('.') && s.contains('/')
-}
-
+/// v1 "next" is always a file id → next_id. Never map next → next_url.
 fn normalize_part_note(mut n: FileNote) -> FileNote {
-    if n.next_id.is_empty() && !n.next.is_empty() && !looks_like_share_url(&n.next) {
+    if n.next_id.is_empty() && !n.next.is_empty() {
         n.next_id = n.next.clone();
-    }
-    if n.next_url.is_empty() && looks_like_share_url(&n.next) {
-        n.next_url = n.next.clone();
     }
     n
 }

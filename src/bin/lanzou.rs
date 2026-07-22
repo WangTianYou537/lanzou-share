@@ -532,10 +532,10 @@ fn cmd_parse(
             .unwrap_or_default();
         let mut next_pwd = head_note.as_ref().map(|n| n.npwd.clone()).unwrap_or_default();
         let mut next_id = head_note.as_ref().map(|n| n.next_id.clone()).unwrap_or_default();
-        // v1 next as id
+        // v1 next is always file id (normalize_part_note already maps it; keep defensive copy)
         if next_id.is_empty() {
             if let Some(n) = head_note.as_ref() {
-                if !n.next.is_empty() && !n.next.contains("://") && !n.next.contains('/') {
+                if !n.next.is_empty() {
                     next_id = n.next.clone();
                 }
             }
@@ -586,10 +586,7 @@ fn cmd_parse(
                                 following = n.next_url;
                                 following_pwd = n.npwd;
                                 following_id = n.next_id;
-                                if following_id.is_empty()
-                                    && !n.next.is_empty()
-                                    && !n.next.contains("://")
-                                {
+                                if following_id.is_empty() && !n.next.is_empty() {
                                     following_id = n.next;
                                 }
                             }
