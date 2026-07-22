@@ -878,10 +878,14 @@ impl Account {
         }
         let mut parts = Vec::with_capacity(total);
         for (i, sp) in staged.iter().enumerate() {
-            let (next_url, next_pwd) = if i + 1 < staged.len() {
-                (shares[i + 1].0.as_str(), shares[i + 1].1.as_str())
+            let (next_id, next_url, next_pwd) = if i + 1 < staged.len() {
+                (
+                    staged[i + 1].file_id.as_str(),
+                    shares[i + 1].0.as_str(),
+                    shares[i + 1].1.as_str(),
+                )
             } else {
-                ("", "")
+                ("", "", "")
             };
             if !sp.file_id.is_empty() {
                 let note = crate::notes::format_part_note(
@@ -891,6 +895,7 @@ impl Account {
                     sp.index,
                     total,
                     sp.size,
+                    next_id,
                     next_url,
                     next_pwd,
                 );

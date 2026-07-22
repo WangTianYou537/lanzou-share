@@ -518,7 +518,7 @@ fn cmd_parse(
     }
 
     if result.note_kind == "part" {
-        // Walk next share URLs from notes (no account required).
+        // Prefer nextUrl; fall back to nextId via account cookie.
         let head_note = parse_file_note(&result.description);
         let mut jobs: Vec<(usize, String, String)> = vec![(
             head_note.as_ref().map(|n| n.index).unwrap_or(1),
@@ -526,54 +526,120 @@ fn cmd_parse(
             pwd_str.clone(),
         )];
         let mut total = head_note.as_ref().map(|n| n.total).unwrap_or(1);
-        let mut next_url = head_note.as_ref().map(|n| normalize_share_url(&n.next)).unwrap_or_default();
+        let mut next_url = head_note
+            .as_ref()
+            .map(|n| normalize_share_url(&n.next_url))
+            .unwrap_or_default();
         let mut next_pwd = head_note.as_ref().map(|n| n.npwd.clone()).unwrap_or_default();
-        let mut seen = std::collections::HashSet::new();
-        seen.insert(url.clone());
-        let mut guard = 0;
-        while !next_url.is_empty() && guard < 256 {
-            guard += 1;
-            if !seen.insert(next_url.clone()) {
-                break;
-            }
-            let mut nc = match Client::new() {
-                Ok(c) => c,
-                Err(e) => {
-                    eprintln!("[error] {e}");
-                    return ExitCode::from(1);
+        let mut next_id = head_note.as_ref().map(|n| n.next_id.clone()).unwrap_or_default();
+        // v1 next as id
+        if next_id.is_empty() {
+            if let Some(n) = head_note.as_ref() {
+                if !n.next.is_empty() && !n.next.contains("://") && !n.next.contains('/') {
+                    next_id = n.next.clone();
                 }
-            };
-            let opts = ParseOptions {
-                password: if next_pwd.is_empty() {
-                    None
-                } else {
-                    Some(next_pwd.clone())
-                },
-                resolve_direct: false,
-            };
-            match nc.parse(&next_url, opts) {
-                Ok(nres) => {
-                    let mut idx = jobs.len() + 1;
-                    let mut following = String::new();
-                    let mut following_pwd = String::new();
-                    if !nres.note_kind.is_empty() {
+            }
+        }
+        let mut seen_url = std::collections::HashSet::new();
+        seen_url.insert(url.clone());
+        let mut seen_id = std::collections::HashSet::new();
+        seen_id.insert(result.fid.clone());
+        let cookie_path = default_cookie_path();
+        let acc = Account::new("", "")
+            .ok()
+            .map(|a| a.with_cookie_file(&cookie_path))
+            .filter(|a| a.verification());
+        let mut guard = 0;
+        while guard < 256 {
+            guard += 1;
+            if !next_url.is_empty() {
+                if !seen_url.insert(next_url.clone()) {
+                    break;
+                }
+                let mut nc = match Client::new() {
+                    Ok(c) => c,
+                    Err(e) => {
+                        eprintln!("[error] {e}");
+                        return ExitCode::from(1);
+                    }
+                };
+                let opts = ParseOptions {
+                    password: if next_pwd.is_empty() {
+                        None
+                    } else {
+                        Some(next_pwd.clone())
+                    },
+                    resolve_direct: false,
+                };
+                match nc.parse(&next_url, opts) {
+                    Ok(nres) => {
+                        let mut idx = jobs.len() + 1;
+                        let mut following = String::new();
+                        let mut following_pwd = String::new();
+                        let mut following_id = String::new();
                         if let Some(n) = parse_file_note(&nres.description) {
                             if n.kind == "part" {
                                 idx = n.index;
                                 if n.total > total {
                                     total = n.total;
                                 }
-                                following = n.next;
+                                following = n.next_url;
                                 following_pwd = n.npwd;
+                                following_id = n.next_id;
+                                if following_id.is_empty()
+                                    && !n.next.is_empty()
+                                    && !n.next.contains("://")
+                                {
+                                    following_id = n.next;
+                                }
                             }
                         }
+                        jobs.push((idx, next_url.clone(), next_pwd.clone()));
+                        next_url = normalize_share_url(&following);
+                        next_pwd = following_pwd;
+                        next_id = following_id;
+                        continue;
                     }
-                    jobs.push((idx, next_url.clone(), next_pwd.clone()));
-                    next_url = normalize_share_url(&following);
+                    Err(e) => {
+                        if next_id.is_empty() || acc.is_none() {
+                            eprintln!("[warn] next part share: {e}");
+                            break;
+                        }
+                        next_url.clear();
+                    }
+                }
+            }
+            if next_id.is_empty() {
+                break;
+            }
+            if !seen_id.insert(next_id.clone()) {
+                break;
+            }
+            let Some(ref acc) = acc else {
+                eprintln!(
+                    "[warn] part note nextId={next_id} needs account cookie (no nextUrl); stopping chain"
+                );
+                break;
+            };
+            match acc.get_file_download_info(&next_id) {
+                Ok((share, p)) => {
+                    let desc = acc.get_file_describe(&next_id).unwrap_or_default();
+                    let (idx, following_url, following_pwd, following_id, tot) =
+                        if let Some(pm) = parse_part_note(&desc) {
+                            (pm.index, pm.next_url, pm.npwd, pm.next_id, pm.total)
+                        } else {
+                            (jobs.len() + 1, String::new(), String::new(), String::new(), total)
+                        };
+                    if tot > total {
+                        total = tot;
+                    }
+                    jobs.push((idx, share, p));
+                    next_url = normalize_share_url(&following_url);
                     next_pwd = following_pwd;
+                    next_id = following_id;
                 }
                 Err(e) => {
-                    eprintln!("[warn] next part share: {e}");
+                    eprintln!("[warn] next part id {next_id}: {e}");
                     break;
                 }
             }

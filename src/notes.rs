@@ -3,16 +3,16 @@
 //! ```json
 //! {"v":1,"kind":"raw","name":"a.txt","as":"a.txt","size":12}
 //! {"v":1,"kind":"convert","name":"a.dex","as":"a.dex.zip","mode":"zip","suffix":"zip","size":20}
-//! {"v":1,"kind":"part","id":"...","name":"big.bin","as":"big_s001.zip","index":1,"total":3,"size":1048576,"next":"https://.../xxx","npwd":"ab12"}
+//! {"v":2,"kind":"part","id":"...","name":"big.bin","as":"big_s001.zip","index":1,"total":3,"size":1048576,
+//!  "nextId":"123","nextUrl":"https://.../xxx","npwd":"ab12"}
 //!
-//! `next` is the following part's share URL; `npwd` is its password. Not compatible
-//! with pre-0.4 notes that stored file ids in `next`.
+//! Part chain: v1 `next` is file id; v2 uses `nextId` + `nextUrl` (+ `npwd`).
 //! ```
 
 use serde::{Deserialize, Serialize};
 
 /// Note schema version.
-pub const NOTE_VERSION: u32 = 1;
+pub const NOTE_VERSION: u32 = 2;
 
 /// Unified note schema written to file descriptions.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -36,10 +36,16 @@ pub struct FileNote {
     pub total: usize,
     #[serde(default, skip_serializing_if = "is_zero_u64")]
     pub size: u64,
-    /// Next part share URL (kind=part).
+    /// v1 only: next part remote file id.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub next: String,
-    /// Password for the next part share (kind=part).
+    /// v2: next part file id.
+    #[serde(default, skip_serializing_if = "String::is_empty", rename = "nextId")]
+    pub next_id: String,
+    /// v2: next part share URL.
+    #[serde(default, skip_serializing_if = "String::is_empty", rename = "nextUrl")]
+    pub next_url: String,
+    /// Password for next_url (kind=part).
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub npwd: String,
 }
@@ -101,6 +107,7 @@ pub fn format_part_note(
     index: usize,
     total: usize,
     size: u64,
+    next_file_id: &str,
     next_share_url: &str,
     next_pwd: &str,
 ) -> String {
@@ -113,7 +120,8 @@ pub fn format_part_note(
         index,
         total,
         size,
-        next: next_share_url.into(),
+        next_id: next_file_id.into(),
+        next_url: next_share_url.into(),
         npwd: next_pwd.into(),
         ..Default::default()
     })
@@ -129,7 +137,8 @@ pub struct PartMeta {
     pub index: usize,
     pub total: usize,
     pub size: u64,
-    pub next: String,
+    pub next_id: String,
+    pub next_url: String,
     pub npwd: String,
 }
 
@@ -162,6 +171,9 @@ pub fn parse_file_note(desc: &str) -> Option<FileNote> {
     }
     if n.v == 0 {
         n.v = NOTE_VERSION;
+    }
+    if n.kind == "part" {
+        n = normalize_part_note(n);
     }
     Some(n)
 }
@@ -204,6 +216,28 @@ fn html_unescape(s: &str) -> String {
         .replace("&amp;", "&")
 }
 
+
+fn looks_like_share_url(s: &str) -> bool {
+    let s = s.trim();
+    if s.is_empty() {
+        return false;
+    }
+    if s.starts_with("http://") || s.starts_with("https://") || s.starts_with("//") {
+        return true;
+    }
+    s.contains('.') && s.contains('/')
+}
+
+fn normalize_part_note(mut n: FileNote) -> FileNote {
+    if n.next_id.is_empty() && !n.next.is_empty() && !looks_like_share_url(&n.next) {
+        n.next_id = n.next.clone();
+    }
+    if n.next_url.is_empty() && looks_like_share_url(&n.next) {
+        n.next_url = n.next.clone();
+    }
+    n
+}
+
 pub fn parse_part_note(desc: &str) -> Option<PartMeta> {
     let n = parse_file_note(desc)?;
     if n.kind != "part" || n.id.is_empty() || n.total < 1 || n.index < 1 {
@@ -216,7 +250,8 @@ pub fn parse_part_note(desc: &str) -> Option<PartMeta> {
         index: n.index,
         total: n.total,
         size: n.size,
-        next: n.next,
+        next_id: n.next_id,
+        next_url: n.next_url,
         npwd: n.npwd,
     })
 }
