@@ -165,6 +165,41 @@ enum Commands {
         #[arg(short = 'c', long = "cookie", env = "LANZOU_COOKIE")]
         cookie: Option<PathBuf>,
     },
+    /// Move file into another folder (folders cannot be moved)
+    #[command(visible_alias = "move")]
+    Mv {
+        /// source file id/name
+        source: String,
+        /// dest folder id/name or / | -1 | root
+        dest: String,
+        #[arg(long = "in", default_value = "-1")]
+        in_folder: String,
+        #[arg(short = 'u', long = "user", env = "LANZOU_USER")]
+        user: Option<String>,
+        #[arg(long = "pass", env = "LANZOU_PASS")]
+        pass: Option<String>,
+        #[arg(short = 'c', long = "cookie", env = "LANZOU_COOKIE")]
+        cookie: Option<PathBuf>,
+    },
+    /// Rename file or folder
+    #[command(visible_alias = "rn", visible_alias = "ren")]
+    Rename {
+        /// id or name
+        target: String,
+        /// new name
+        new_name: String,
+        #[arg(long = "in", default_value = "-1")]
+        in_folder: String,
+        /// only update JSON note display name (no VIP required)
+        #[arg(long = "note")]
+        note: bool,
+        #[arg(short = 'u', long = "user", env = "LANZOU_USER")]
+        user: Option<String>,
+        #[arg(long = "pass", env = "LANZOU_PASS")]
+        pass: Option<String>,
+        #[arg(short = 'c', long = "cookie", env = "LANZOU_COOKIE")]
+        cookie: Option<PathBuf>,
+    },
     /// Show file/folder info
     #[command(visible_alias = "show", visible_alias = "stat")]
     Info {
@@ -330,6 +365,23 @@ fn main() -> ExitCode {
             pass,
             cookie,
         }) => cmd_rm(target, file, folder, in_folder, user, pass, cookie_or_default(cookie)),
+        Some(Commands::Mv {
+            source,
+            dest,
+            in_folder,
+            user,
+            pass,
+            cookie,
+        }) => cmd_mv(source, dest, in_folder, user, pass, cookie_or_default(cookie)),
+        Some(Commands::Rename {
+            target,
+            new_name,
+            in_folder,
+            note,
+            user,
+            pass,
+            cookie,
+        }) => cmd_rename(target, new_name, in_folder, note, user, pass, cookie_or_default(cookie)),
         Some(Commands::Info {
             file,
             folder,
@@ -1178,6 +1230,49 @@ fn cmd_rm(
     }
 }
 
+fn cmd_mv(
+    source: String,
+    dest: String,
+    in_folder: String,
+    user: Option<String>,
+    pass: Option<String>,
+    cookie: PathBuf,
+) -> ExitCode {
+    let acc = match open_account(user, pass, cookie) {
+        Ok(a) => a,
+        Err(c) => return c,
+    };
+    match move_target(&acc, &in_folder, &source, &dest) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("[error] {e}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+fn cmd_rename(
+    target: String,
+    new_name: String,
+    in_folder: String,
+    note_only: bool,
+    user: Option<String>,
+    pass: Option<String>,
+    cookie: PathBuf,
+) -> ExitCode {
+    let acc = match open_account(user, pass, cookie) {
+        Ok(a) => a,
+        Err(c) => return c,
+    };
+    match rename_target(&acc, &in_folder, &target, &new_name, note_only) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("[error] {e}");
+            ExitCode::from(1)
+        }
+    }
+}
+
 fn cmd_info(
     file: Option<String>,
     folder: Option<String>,
@@ -1299,6 +1394,279 @@ fn sanitize_name(name: &str) -> String {
             _ => c,
         })
         .collect()
+}
+
+fn resolve_folder_id(acc: &Account, cur_folder: &str, dest: &str) -> Result<String, String> {
+    let dest = dest.trim();
+    if dest.is_empty() || dest == "/" || dest == "root" || dest == "~" || dest == "-1" {
+        return Ok("-1".into());
+    }
+    if is_digits(dest) || dest == "-1" {
+        return Ok(dest.to_string());
+    }
+    let list = acc.list(cur_folder).map_err(|e| e.to_string())?;
+    if let Some(e) = resolve_entry(&list, dest) {
+        if e.kind != EntryKind::Folder {
+            return Err(format!("destination is a file, not folder: {dest}"));
+        }
+        return Ok(e.id.clone());
+    }
+    if cur_folder != "-1" {
+        if let Ok(root_list) = acc.list("-1") {
+            if let Some(e) = resolve_entry(&root_list, dest) {
+                if e.kind == EntryKind::Folder {
+                    return Ok(e.id.clone());
+                }
+            }
+        }
+    }
+    Err(format!("destination folder not found: {dest}"))
+}
+
+fn move_target(acc: &Account, cur_folder: &str, src: &str, dest: &str) -> Result<(), String> {
+    let list = acc.list(cur_folder).map_err(|e| e.to_string())?;
+    let notes = acc.fetch_notes(&list);
+
+    let (file_ids, label): (Vec<String>, String) =
+        if let Some(r) = resolve_by_notes(&list, &notes, src) {
+            if r.kind == "split" {
+                let ids = r.parts.iter().map(|p| p.file_id.clone()).collect();
+                (ids, format!("{} (split)", r.orig_name))
+            } else {
+                (vec![r.file_id], r.orig_name)
+            }
+        } else if let Some(e) = resolve_entry(&list, src) {
+            if e.kind == EntryKind::Folder {
+                return Err(format!(
+                    "cannot move folder {} (Lanzou has no folder-move API)",
+                    e.name
+                ));
+            }
+            if let Some(note) = notes.get(&e.id) {
+                if let Some(pm) = parse_part_note(note) {
+                    let name = if pm.name.is_empty() {
+                        pm.group_id.clone()
+                    } else {
+                        pm.name.clone()
+                    };
+                    if let Some(r) = resolve_by_notes(&list, &notes, &name) {
+                        if r.kind == "split" {
+                            return move_target(acc, cur_folder, &name, dest);
+                        }
+                    }
+                }
+            }
+            (vec![e.id.clone()], e.name.clone())
+        } else if is_digits(src) {
+            (vec![src.to_string()], src.to_string())
+        } else {
+            return Err(format!("source not found in folder {cur_folder}: {src}"));
+        };
+
+    let dest_id = resolve_folder_id(acc, cur_folder, dest)?;
+    println!(
+        "[mv] {label} -> folder {dest_id}  files={}",
+        file_ids.len()
+    );
+    let mut failed = 0;
+    for id in &file_ids {
+        match acc.move_file(id, &dest_id) {
+            Ok(raw) => println!("[ok] moved id={id}  {}", raw.trim()),
+            Err(e) => {
+                failed += 1;
+                eprintln!("[warn] move id={id}: {e}");
+            }
+        }
+    }
+    if failed > 0 {
+        return Err(format!("{failed}/{} moves failed", file_ids.len()));
+    }
+    Ok(())
+}
+
+fn rename_target(
+    acc: &Account,
+    cur_folder: &str,
+    target: &str,
+    new_name: &str,
+    note_only: bool,
+) -> Result<(), String> {
+    let new_name = new_name.trim();
+    if new_name.is_empty() {
+        return Err("new name is empty".into());
+    }
+    let list = acc.list(cur_folder).map_err(|e| e.to_string())?;
+    let notes = acc.fetch_notes(&list);
+
+    if let Some(e) = resolve_entry(&list, target) {
+        if e.kind == EntryKind::Folder {
+            let raw = acc
+                .rename_folder(&e.id, new_name, "")
+                .map_err(|e| e.to_string())?;
+            println!("[ok] renamed folder {} -> {new_name}  id={}", e.name, e.id);
+            println!("{raw}");
+            return Ok(());
+        }
+    }
+
+    if let Some(r) = resolve_by_notes(&list, &notes, target) {
+        if r.kind == "split" {
+            if !note_only {
+                eprintln!("[info] split group: updating note display name on all parts (logical)");
+            }
+            let mut failed = 0;
+            for p in &r.parts {
+                match acc.rename_note(&p.file_id, new_name) {
+                    Ok(_) => println!("[ok] note name={new_name}  part id={}", p.file_id),
+                    Err(e) => {
+                        failed += 1;
+                        eprintln!("[warn] note rename part id={}: {e}", p.file_id);
+                    }
+                }
+            }
+            if failed > 0 {
+                return Err(format!("{failed}/{} part notes failed", r.parts.len()));
+            }
+            return Ok(());
+        }
+        if note_only {
+            let raw = acc
+                .rename_note(&r.file_id, new_name)
+                .map_err(|e| e.to_string())?;
+            println!(
+                "[ok] note rename {} -> {new_name}  id={}",
+                r.orig_name, r.file_id
+            );
+            println!("{raw}");
+            return Ok(());
+        }
+        match acc.rename_file(&r.file_id, new_name) {
+            Ok(raw) => {
+                if let Err(e) = acc.rename_note(&r.file_id, new_name) {
+                    eprintln!("[warn] server renamed but note update failed: {e}");
+                }
+                println!(
+                    "[ok] renamed file {} -> {new_name}  id={}",
+                    r.orig_name, r.file_id
+                );
+                println!("{raw}");
+                return Ok(());
+            }
+            Err(e) => {
+                let msg = e.to_string();
+                if msg.contains("会员") {
+                    eprintln!("[warn] server rename requires VIP ({msg}); falling back to --note");
+                    let raw2 = acc
+                        .rename_note(&r.file_id, new_name)
+                        .map_err(|e2| format!("rename VIP-only and note fallback failed: {msg} / {e2}"))?;
+                    println!(
+                        "[ok] note rename {} -> {new_name}  id={} (VIP rename unavailable)",
+                        r.orig_name, r.file_id
+                    );
+                    println!("{raw2}");
+                    return Ok(());
+                }
+                return Err(msg);
+            }
+        }
+    }
+
+    if let Some(e) = resolve_entry(&list, target) {
+        if e.kind == EntryKind::Folder {
+            let raw = acc
+                .rename_folder(&e.id, new_name, "")
+                .map_err(|e| e.to_string())?;
+            println!("[ok] renamed folder {} -> {new_name}  id={}", e.name, e.id);
+            println!("{raw}");
+            return Ok(());
+        }
+        if let Some(note) = notes.get(&e.id) {
+            if let Some(pm) = parse_part_note(note) {
+                let name = if pm.name.is_empty() {
+                    pm.group_id.clone()
+                } else {
+                    pm.name.clone()
+                };
+                return rename_target(acc, cur_folder, &name, new_name, true);
+            }
+        }
+        if note_only {
+            match acc.rename_note(&e.id, new_name) {
+                Ok(raw) => {
+                    println!("[ok] note rename {} -> {new_name}  id={}", e.name, e.id);
+                    println!("{raw}");
+                    return Ok(());
+                }
+                Err(_) => {
+                    let body = lanzou_share::format_raw_note(new_name, &e.name, 0);
+                    let raw2 = acc
+                        .set_file_describe(&e.id, &body)
+                        .map_err(|e| e.to_string())?;
+                    println!(
+                        "[ok] wrote raw note name={new_name} as={}  id={}",
+                        e.name, e.id
+                    );
+                    println!("{raw2}");
+                    return Ok(());
+                }
+            }
+        }
+        match acc.rename_file(&e.id, new_name) {
+            Ok(raw) => {
+                println!("[ok] renamed file {} -> {new_name}  id={}", e.name, e.id);
+                println!("{raw}");
+                return Ok(());
+            }
+            Err(e2) => {
+                let msg = e2.to_string();
+                if msg.contains("会员") {
+                    eprintln!("[warn] server rename requires VIP ({msg}); falling back to --note");
+                    return rename_target(acc, cur_folder, target, new_name, true);
+                }
+                return Err(msg);
+            }
+        }
+    }
+
+    if is_digits(target) {
+        if let Ok(info) = acc.get_folder_info(target) {
+            if !info.name.is_empty() {
+                let raw = acc
+                    .rename_folder(target, new_name, &info.description)
+                    .map_err(|e| e.to_string())?;
+                println!(
+                    "[ok] renamed folder {} -> {new_name}  id={target}",
+                    info.name
+                );
+                println!("{raw}");
+                return Ok(());
+            }
+        }
+        if note_only {
+            let raw = acc
+                .rename_note(target, new_name)
+                .map_err(|e| e.to_string())?;
+            println!("[ok] note rename id={target} -> {new_name}");
+            println!("{raw}");
+            return Ok(());
+        }
+        match acc.rename_file(target, new_name) {
+            Ok(raw) => {
+                println!("[ok] renamed file id={target} -> {new_name}");
+                println!("{raw}");
+                return Ok(());
+            }
+            Err(e) => {
+                let msg = e.to_string();
+                if msg.contains("会员") {
+                    eprintln!("[warn] server rename requires VIP ({msg}); falling back to --note");
+                    return rename_target(acc, cur_folder, target, new_name, true);
+                }
+                return Err(msg);
+            }
+        }
+    }
+    Err(format!("not found in folder {cur_folder}: {target}"))
 }
 
 fn resolve_entry<'a>(list: &'a [ListEntry], target: &str) -> Option<&'a ListEntry> {
@@ -1931,6 +2299,7 @@ impl Shell {
                 println!("download|dl|down|fetch <id|name> [-j N] [-o DIR]");
                 println!("info|show|stat <id|name> | upload|up|put <path>");
                 println!("mkdir|md <name> | rm|delete|del|remove <id|name>");
+                println!("mv|move <file> <dest-folder|/|-1> | rename|rn|ren <id|name> <new-name> [--note]");
                 println!("login|signin [--user U --pass P] | logout|signout");
                 println!("config|conf|cfg [list|get|set ...] | exit|quit|q");
                 Ok(false)
@@ -1989,6 +2358,28 @@ impl Shell {
                     return Err("usage: rm <id|name>".into());
                 }
                 self.cmd_rm(&args[0])?;
+                Ok(false)
+            }
+            "mv" | "move" => {
+                if args.len() < 2 {
+                    return Err("usage: mv|move <file> <dest-folder|/|-1>".into());
+                }
+                move_target(&self.acc, self.folder_id(), &args[0], &args[1])?;
+                Ok(false)
+            }
+            "rename" | "rn" | "ren" => {
+                if args.len() < 2 {
+                    return Err("usage: rename|rn|ren <id|name> <new-name> [--note]".into());
+                }
+                let note_only = args.iter().any(|a| a == "--note");
+                let new_name = args
+                    .iter()
+                    .skip(1)
+                    .rev()
+                    .find(|a| a.as_str() != "--note")
+                    .cloned()
+                    .unwrap_or_else(|| args[1].clone());
+                rename_target(&self.acc, self.folder_id(), &args[0], &new_name, note_only)?;
                 Ok(false)
             }
             "login" | "signin" | "auth" => {

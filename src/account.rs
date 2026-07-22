@@ -660,9 +660,88 @@ impl Account {
     }
 
     pub fn move_file(&self, file_id: &str, folder_id: &str) -> Result<String> {
+        let folder_id = if folder_id.is_empty() { "-1" } else { folder_id };
         self.post_task(&format!(
             "task=20&folder_id={folder_id}&file_id={file_id}"
         ))
+    }
+
+    /// Fetch editable file-name stem (task=46 type=1).
+    pub fn get_file_name_stem(&self, file_id: &str) -> Result<String> {
+        let raw = self.post_task(&format!("task=46&file_id={file_id}&type=1"))?;
+        let v: Value = serde_json::from_str(&raw)
+            .map_err(|e| Error::Parse(format!("rename stem json: {e}; {raw}")))?;
+        if json_str(&v["zt"]) != "1" {
+            let info = json_str(&v["info"]);
+            return Err(Error::Parse(if info.is_empty() { raw } else { info }));
+        }
+        Ok(json_str(&v["info"]))
+    }
+
+    /// Rename a file (task=46 type=2). Official site restricts this to VIP.
+    /// `new_name` may be a stem or full filename; a simple extension is stripped.
+    pub fn rename_file(&self, file_id: &str, new_name: &str) -> Result<String> {
+        let new_name = new_name.trim();
+        if file_id.is_empty() || new_name.is_empty() {
+            return Err(Error::Parse("file id and new name required".into()));
+        }
+        let stem = {
+            if let Some(i) = new_name.rfind('.') {
+                if i > 0 && i < new_name.len() - 1 {
+                    let ext = &new_name[i + 1..];
+                    if ext.len() <= 8 && ext.chars().all(|c| c.is_ascii_alphanumeric()) {
+                        &new_name[..i]
+                    } else {
+                        new_name
+                    }
+                } else {
+                    new_name
+                }
+            } else {
+                new_name
+            }
+        };
+        let raw = self.post_task(&format!(
+            "task=46&file_id={file_id}&file_name={}&type=2",
+            urlencoding::encode(stem),
+        ))?;
+        let v: Value = serde_json::from_str(&raw)
+            .map_err(|e| Error::Parse(format!("rename json: {e}; {raw}")))?;
+        if json_str(&v["zt"]) != "1" {
+            let info = json_str(&v["info"]);
+            return Err(Error::Parse(if info.is_empty() { raw } else { info }));
+        }
+        Ok(raw)
+    }
+
+    /// Rename a folder (task=4). Empty describe keeps the existing description.
+    pub fn rename_folder(&self, folder_id: &str, new_name: &str, describe: &str) -> Result<String> {
+        let new_name = new_name.trim();
+        if folder_id.is_empty() || new_name.is_empty() {
+            return Err(Error::Parse("folder id and new name required".into()));
+        }
+        let mut desc = describe.to_string();
+        if desc.is_empty() {
+            if let Ok(info) = self.get_folder_info(folder_id) {
+                desc = info.description;
+            }
+        }
+        self.set_folder_name_and_describe(folder_id, new_name, &desc)
+    }
+
+    /// Update display `name` inside a convert/raw/part JSON note (logical rename).
+    pub fn rename_note(&self, file_id: &str, new_name: &str) -> Result<String> {
+        let new_name = new_name.trim();
+        if file_id.is_empty() || new_name.is_empty() {
+            return Err(Error::Parse("file id and new name required".into()));
+        }
+        let desc = self.get_file_describe(file_id)?;
+        let mut n = crate::notes::parse_file_note(&desc)
+            .ok_or_else(|| Error::Parse(format!("no JSON note on file {file_id}")))?;
+        n.name = new_name.into();
+        let body = serde_json::to_string(&n)
+            .map_err(|e| Error::Parse(format!("note marshal: {e}")))?;
+        self.set_file_describe(file_id, &body)
     }
 
     pub fn delete_file(&self, file_id: &str) -> Result<String> {
