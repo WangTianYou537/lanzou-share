@@ -1,7 +1,7 @@
 use clap::{Parser, Subcommand};
 use lanzou_share::{
     config_keys, config_path_used, get_config, get_config_value, is_upload_allowed_ext,
-    parse_convert_note, parse_part_note, save_config, set_config_value, unescape_list, Account,
+    parse_convert_note, parse_file_note, parse_part_note, save_config, set_config_value, unescape_list, Account,
     Client, EntryKind, Error, ListEntry, ParseOptions,
 };
 use std::collections::HashMap;
@@ -70,12 +70,16 @@ enum Commands {
         password: Option<String>,
         #[arg(long = "down")]
         down: bool,
+        #[arg(long = "no-down")]
+        no_down: bool,
         #[arg(short = 'o', long = "output-dir", default_value = ".")]
         output_dir: String,
         #[arg(short = 'f', long = "filename")]
         filename: Option<String>,
         #[arg(long = "no-resolve")]
         no_resolve: bool,
+        #[arg(short = 'c', long = "cookie", env = "LANZOU_COOKIE")]
+        cookie: Option<PathBuf>,
     },
     /// Login and save cookie
     #[command(visible_alias = "signin", visible_alias = "auth")]
@@ -267,10 +271,12 @@ fn main() -> ExitCode {
             url,
             password,
             down,
+            no_down,
             output_dir,
             filename,
             no_resolve,
-        }) => cmd_parse(url, password, down, output_dir, filename, no_resolve),
+            cookie,
+        }) => cmd_parse(url, password, down, no_down, output_dir, filename, no_resolve, cookie),
         Some(Commands::Login {
             user,
             pass,
@@ -399,9 +405,11 @@ fn cmd_parse(
     url: String,
     password: Option<String>,
     down: bool,
+    no_down: bool,
     output_dir: String,
     filename: Option<String>,
     no_resolve: bool,
+    cookie: Option<PathBuf>,
 ) -> ExitCode {
     let mut client = match Client::new() {
         Ok(c) => c,
@@ -410,6 +418,7 @@ fn cmd_parse(
             return ExitCode::from(1);
         }
     };
+    let pwd = password.clone();
     let opts = ParseOptions {
         password,
         resolve_direct: !no_resolve,
@@ -428,6 +437,20 @@ fn cmd_parse(
     println!("============================================================");
     println!("  fid:      {}", result.fid);
     println!("  filename: {}", result.filename.as_deref().unwrap_or("?"));
+    if !result.orig_name.is_empty() {
+        println!("  orig:     {}", result.orig_name);
+    }
+    if !result.note_kind.is_empty() {
+        println!("  note:     {}", result.note_kind);
+    }
+    if !result.description.is_empty() {
+        let d = if result.description.len() > 200 {
+            format!("{}...", &result.description[..200])
+        } else {
+            result.description.clone()
+        };
+        println!("  desc:     {d}");
+    }
     println!(
         "  password: {}",
         if result.password_protected {
@@ -443,15 +466,201 @@ fn cmd_parse(
         println!("  direct:   {d}");
     }
     println!("============================================================");
-    if down {
-        let u = result.direct.as_deref().unwrap_or(result.telecom.as_str());
-        let name = filename.as_deref().or(result.filename.as_deref());
-        match client.download(u, &output_dir, name, None) {
-            Ok(p) => println!("[done] saved: {}", p.display()),
-            Err(e) => {
-                eprintln!("[error] download failed: {e}");
+
+    let mut want_down = down;
+    if !no_down && (result.note_kind == "convert" || result.note_kind == "part") {
+        want_down = true;
+    }
+    if !want_down {
+        return ExitCode::SUCCESS;
+    }
+
+    let out = PathBuf::from(&output_dir);
+    let pwd_str = pwd.unwrap_or_default();
+
+    if result.note_kind == "convert" || result.note_kind == "raw" {
+        let remote = result
+            .filename
+            .clone()
+            .unwrap_or_else(|| "download.bin".into());
+        let orig = if result.orig_name.is_empty() {
+            remote.clone()
+        } else {
+            result.orig_name.clone()
+        };
+        let tmp_name = format!(".dl-{remote}");
+        if let Err(e) = download_share(&url, &pwd_str, &out, &tmp_name) {
+            eprintln!("[error] download: {e}");
+            return ExitCode::from(1);
+        }
+        let tmp = out.join(&tmp_name);
+        let final_name = filename.unwrap_or(orig);
+        let final_path = out.join(sanitize_name(&final_name));
+        // unzip if convert zip
+        let note = parse_file_note(&result.description);
+        let mode = note.as_ref().map(|n| n.mode.as_str()).unwrap_or("");
+        let kind = note.as_ref().map(|n| n.kind.as_str()).unwrap_or("");
+        if kind == "convert" && (mode == "zip" || mode.is_empty()) {
+            if unzip_single_to(&tmp, &final_path).is_ok() {
+                let _ = std::fs::remove_file(&tmp);
+                println!("[download] restored convert -> {}", final_path.display());
+                println!("[done] saved: {}", final_path.display());
+                return ExitCode::SUCCESS;
+            }
+        }
+        let _ = std::fs::rename(&tmp, &final_path).or_else(|_| {
+            std::fs::copy(&tmp, &final_path).map(|_| {
+                let _ = std::fs::remove_file(&tmp);
+            })
+        });
+        println!("[done] saved: {}", final_path.display());
+        return ExitCode::SUCCESS;
+    }
+
+    if result.note_kind == "part" {
+        // Build chain via account cookie when available
+        let mut jobs: Vec<(usize, String, String)> = vec![(
+            parse_file_note(&result.description)
+                .map(|n| n.index)
+                .unwrap_or(1),
+            url.clone(),
+            pwd_str.clone(),
+        )];
+        let mut total = parse_file_note(&result.description)
+            .map(|n| n.total)
+            .unwrap_or(1);
+        let mut next_id = parse_file_note(&result.description)
+            .map(|n| n.next)
+            .unwrap_or_default();
+        let cookie_path = cookie.unwrap_or_else(default_cookie_path);
+        if !next_id.is_empty() {
+            if let Ok(acc) = Account::new("", "").map(|a| a.with_cookie_file(&cookie_path)) {
+                if acc.verification() {
+                    let mut seen = std::collections::HashSet::new();
+                    seen.insert(result.fid.clone());
+                    let mut guard = 0;
+                    while !next_id.is_empty() && guard < 256 {
+                        guard += 1;
+                        if !seen.insert(next_id.clone()) {
+                            break;
+                        }
+                        match acc.get_file_download_info(&next_id) {
+                            Ok((share, p)) => {
+                                let desc = acc.get_file_describe(&next_id).unwrap_or_default();
+                                let (idx, following, tot) = if let Some(pm) = parse_part_note(&desc)
+                                {
+                                    (pm.index, pm.next, pm.total)
+                                } else {
+                                    (jobs.len() + 1, String::new(), total)
+                                };
+                                if tot > total {
+                                    total = tot;
+                                }
+                                jobs.push((idx, share, p));
+                                next_id = following;
+                            }
+                            Err(e) => {
+                                eprintln!("[warn] next part {next_id}: {e}");
+                                break;
+                            }
+                        }
+                    }
+                } else {
+                    eprintln!(
+                        "[warn] part note needs login cookie to merge remaining parts; try lanzou login first"
+                    );
+                }
+            } else {
+                eprintln!(
+                    "[warn] part note needs login cookie to merge remaining parts; try lanzou login first"
+                );
+            }
+        }
+        jobs.sort_by_key(|(i, _, _)| *i);
+        let orig = if result.orig_name.is_empty() {
+            "merged.bin".into()
+        } else {
+            result.orig_name.clone()
+        };
+        let orig = filename.unwrap_or(orig);
+        let orig_s = sanitize_name(&orig);
+        println!(
+            "[download] split {}  parts={}/{}  (serial, note chain)",
+            orig_s,
+            jobs.len(),
+            total
+        );
+        let mut parts: Vec<(usize, PathBuf)> = Vec::new();
+        for (n, (idx, share, p)) in jobs.iter().enumerate() {
+            let n = n + 1;
+            println!("[download] part {n}/{} index={idx}", jobs.len());
+            let part_name = format!(".{orig_s}.s{idx:03}.download");
+            if let Err(e) = download_share(share, p, &out, &part_name) {
+                eprintln!("[error] part index={idx}: {e}");
+                for (_, f) in &parts {
+                    let _ = std::fs::remove_file(f);
+                }
                 return ExitCode::from(1);
             }
+            let downloaded = out.join(&part_name);
+            let prefer = out.join(format!(".{orig_s}.s{idx:03}.bin"));
+            match extract_part_payload(&downloaded, &prefer) {
+                Ok(raw) => {
+                    let _ = std::fs::remove_file(&downloaded);
+                    parts.push((*idx, raw));
+                    println!("[ok {n}/{}] part index={idx}", jobs.len());
+                }
+                Err(e) => {
+                    eprintln!("[error] part index={idx} extract: {e}");
+                    let _ = std::fs::remove_file(&downloaded);
+                    for (_, f) in &parts {
+                        let _ = std::fs::remove_file(f);
+                    }
+                    return ExitCode::from(1);
+                }
+            }
+            if n < jobs.len() {
+                std::thread::sleep(std::time::Duration::from_millis(400));
+            }
+        }
+        parts.sort_by_key(|(i, _)| *i);
+        let out_path = out.join(&orig_s);
+        match std::fs::File::create(&out_path) {
+            Ok(mut o) => {
+                for (_, f) in parts {
+                    match std::fs::File::open(&f) {
+                        Ok(mut inp) => {
+                            if let Err(e) = std::io::copy(&mut inp, &mut o) {
+                                eprintln!("[error] merge: {e}");
+                                return ExitCode::from(1);
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("[error] merge open: {e}");
+                            return ExitCode::from(1);
+                        }
+                    }
+                    let _ = std::fs::remove_file(f);
+                }
+            }
+            Err(e) => {
+                eprintln!("[error] create: {e}");
+                return ExitCode::from(1);
+            }
+        }
+        println!("[done] merged: {}", out_path.display());
+        println!("[done] saved: {}", out_path.display());
+        return ExitCode::SUCCESS;
+    }
+
+    // plain download
+    let u = result.direct.as_deref().unwrap_or(result.telecom.as_str());
+    let name = filename.as_deref().or(result.filename.as_deref());
+    match client.download(u, &output_dir, name, None) {
+        Ok(p) => println!("[done] saved: {}", p.display()),
+        Err(e) => {
+            eprintln!("[error] download failed: {e}");
+            return ExitCode::from(1);
         }
     }
     ExitCode::SUCCESS

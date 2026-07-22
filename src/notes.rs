@@ -223,3 +223,73 @@ pub fn parse_convert_note(desc: &str) -> Option<ConvertMeta> {
         _ => None,
     }
 }
+
+
+/// Pull the "文件描述" field from a share page HTML (often entity-encoded JSON).
+pub fn extract_share_description(html: &str) -> String {
+    if html.is_empty() {
+        return String::new();
+    }
+    const LABEL: &str = "文件描述";
+    if let Some(i) = html.find(LABEL) {
+        let mut rest = &html[i + LABEL.len()..];
+        rest = rest.trim_start_matches(['：', ':', ' ', '\t', '\r', '\n']);
+        loop {
+            rest = rest.trim_start();
+            if rest.starts_with('<') {
+                if let Some(j) = rest.find('>') {
+                    rest = &rest[j + 1..];
+                    continue;
+                }
+            }
+            break;
+        }
+        if let Some(k) = rest.find('{') {
+            let mut depth = 0i32;
+            for (p, ch) in rest[k..].char_indices() {
+                match ch {
+                    '{' => depth += 1,
+                    '}' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            return rest[k..=k + p].trim().to_string();
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        for sep in ["</td>", "<td", "<div"] {
+            if let Some(j) = rest.find(sep) {
+                let cand = rest[..j]
+                    .replace("<br>", "")
+                    .replace("<br/>", "")
+                    .replace("<br />", "");
+                let cand = cand.trim();
+                if !cand.is_empty() {
+                    return cand.to_string();
+                }
+            }
+        }
+    }
+    for marker in ["\"kind\"", "&quot;kind&quot;", "\"v\":1", "&quot;v&quot;:1"] {
+        if let Some(k) = html.find(marker) {
+            if let Some(start) = html[..k + 1].rfind('{') {
+                let mut depth = 0i32;
+                for (p, ch) in html[start..].char_indices() {
+                    match ch {
+                        '{' => depth += 1,
+                        '}' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                return html[start..=start + p].trim().to_string();
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+    String::new()
+}

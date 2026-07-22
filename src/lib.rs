@@ -19,8 +19,9 @@ pub use config::{
     get_config_value, load_config, save_config, set_config_cache, set_config_value, Config,
 };
 pub use notes::{
-    format_convert_note, format_part_note, format_raw_note, parse_convert_note, parse_file_note,
-    parse_part_note, ConvertMeta, FileNote, PartMeta, NOTE_VERSION,
+    extract_share_description, format_convert_note, format_part_note, format_raw_note,
+    parse_convert_note, parse_file_note, parse_part_note, ConvertMeta, FileNote, PartMeta,
+    NOTE_VERSION,
 };
 /// Crate / CLI version (from Cargo.toml).
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -87,6 +88,12 @@ pub struct ParseResult {
     pub normal: String,
     pub direct: Option<String>,
     pub saved_path: Option<PathBuf>,
+    /// Share-page description (often a JSON FileNote).
+    pub description: String,
+    /// Note kind: raw|convert|part when present.
+    pub note_kind: String,
+    /// Original basename from convert/part/raw note.
+    pub orig_name: String,
 }
 
 /// Lanzou HTTP client with simple cookie jar.
@@ -309,6 +316,14 @@ impl Client {
             (fid, links, false)
         };
 
+        let desc = extract_share_description(&html);
+        let mut note_kind = String::new();
+        let mut orig_name = String::new();
+        if let Some(n) = parse_file_note(&desc) {
+            note_kind = n.kind.clone();
+            orig_name = n.name.clone();
+        }
+
         let mut result = ParseResult {
             fid,
             filename: self.last_filename.clone(),
@@ -319,6 +334,9 @@ impl Client {
             normal: links.normal.clone(),
             direct: None,
             saved_path: None,
+            description: html_unescape_simple(&desc),
+            note_kind,
+            orig_name,
         };
 
         if opts.resolve_direct {
@@ -985,6 +1003,16 @@ impl AjaxRiskResp {
             other => other.to_string(),
         }
     }
+}
+
+fn html_unescape_simple(s: &str) -> String {
+    s.replace("&quot;", "\"")
+        .replace("&#34;", "\"")
+        .replace("&apos;", "'")
+        .replace("&#39;", "'")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&amp;", "&")
 }
 
 fn is_cdn_risk_page(html: &str) -> bool {
