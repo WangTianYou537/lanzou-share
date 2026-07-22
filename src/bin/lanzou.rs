@@ -409,7 +409,7 @@ fn cmd_parse(
     output_dir: String,
     filename: Option<String>,
     no_resolve: bool,
-    cookie: Option<PathBuf>,
+    _cookie: Option<PathBuf>,
 ) -> ExitCode {
     let mut client = match Client::new() {
         Ok(c) => c,
@@ -518,62 +518,64 @@ fn cmd_parse(
     }
 
     if result.note_kind == "part" {
-        // Build chain via account cookie when available
+        // Walk next share URLs from notes (no account required).
+        let head_note = parse_file_note(&result.description);
         let mut jobs: Vec<(usize, String, String)> = vec![(
-            parse_file_note(&result.description)
-                .map(|n| n.index)
-                .unwrap_or(1),
+            head_note.as_ref().map(|n| n.index).unwrap_or(1),
             url.clone(),
             pwd_str.clone(),
         )];
-        let mut total = parse_file_note(&result.description)
-            .map(|n| n.total)
-            .unwrap_or(1);
-        let mut next_id = parse_file_note(&result.description)
-            .map(|n| n.next)
-            .unwrap_or_default();
-        let cookie_path = cookie.unwrap_or_else(default_cookie_path);
-        if !next_id.is_empty() {
-            if let Ok(acc) = Account::new("", "").map(|a| a.with_cookie_file(&cookie_path)) {
-                if acc.verification() {
-                    let mut seen = std::collections::HashSet::new();
-                    seen.insert(result.fid.clone());
-                    let mut guard = 0;
-                    while !next_id.is_empty() && guard < 256 {
-                        guard += 1;
-                        if !seen.insert(next_id.clone()) {
-                            break;
-                        }
-                        match acc.get_file_download_info(&next_id) {
-                            Ok((share, p)) => {
-                                let desc = acc.get_file_describe(&next_id).unwrap_or_default();
-                                let (idx, following, tot) = if let Some(pm) = parse_part_note(&desc)
-                                {
-                                    (pm.index, pm.next, pm.total)
-                                } else {
-                                    (jobs.len() + 1, String::new(), total)
-                                };
-                                if tot > total {
-                                    total = tot;
+        let mut total = head_note.as_ref().map(|n| n.total).unwrap_or(1);
+        let mut next_url = head_note.as_ref().map(|n| normalize_share_url(&n.next)).unwrap_or_default();
+        let mut next_pwd = head_note.as_ref().map(|n| n.npwd.clone()).unwrap_or_default();
+        let mut seen = std::collections::HashSet::new();
+        seen.insert(url.clone());
+        let mut guard = 0;
+        while !next_url.is_empty() && guard < 256 {
+            guard += 1;
+            if !seen.insert(next_url.clone()) {
+                break;
+            }
+            let mut nc = match Client::new() {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("[error] {e}");
+                    return ExitCode::from(1);
+                }
+            };
+            let opts = ParseOptions {
+                password: if next_pwd.is_empty() {
+                    None
+                } else {
+                    Some(next_pwd.clone())
+                },
+                resolve_direct: false,
+            };
+            match nc.parse(&next_url, opts) {
+                Ok(nres) => {
+                    let mut idx = jobs.len() + 1;
+                    let mut following = String::new();
+                    let mut following_pwd = String::new();
+                    if !nres.note_kind.is_empty() {
+                        if let Some(n) = parse_file_note(&nres.description) {
+                            if n.kind == "part" {
+                                idx = n.index;
+                                if n.total > total {
+                                    total = n.total;
                                 }
-                                jobs.push((idx, share, p));
-                                next_id = following;
-                            }
-                            Err(e) => {
-                                eprintln!("[warn] next part {next_id}: {e}");
-                                break;
+                                following = n.next;
+                                following_pwd = n.npwd;
                             }
                         }
                     }
-                } else {
-                    eprintln!(
-                        "[warn] part note needs login cookie to merge remaining parts; try lanzou login first"
-                    );
+                    jobs.push((idx, next_url.clone(), next_pwd.clone()));
+                    next_url = normalize_share_url(&following);
+                    next_pwd = following_pwd;
                 }
-            } else {
-                eprintln!(
-                    "[warn] part note needs login cookie to merge remaining parts; try lanzou login first"
-                );
+                Err(e) => {
+                    eprintln!("[warn] next part share: {e}");
+                    break;
+                }
             }
         }
         jobs.sort_by_key(|(i, _, _)| *i);
@@ -653,7 +655,7 @@ fn cmd_parse(
         return ExitCode::SUCCESS;
     }
 
-    // plain download
+// plain download
     let u = result.direct.as_deref().unwrap_or(result.telecom.as_str());
     let name = filename.as_deref().or(result.filename.as_deref());
     match client.download(u, &output_dir, name, None) {
@@ -1204,6 +1206,23 @@ struct DlJob {
 
 fn is_digits(s: &str) -> bool {
     !s.is_empty() && s.chars().all(|c| c.is_ascii_digit())
+}
+
+fn normalize_share_url(u: &str) -> String {
+    let u = u.trim();
+    if u.is_empty() {
+        return String::new();
+    }
+    if let Some(rest) = u.strip_prefix("//") {
+        return format!("https://{rest}");
+    }
+    if u.starts_with("http://") || u.starts_with("https://") {
+        return u.to_string();
+    }
+    if u.contains('.') && u.contains('/') {
+        return format!("https://{u}");
+    }
+    u.to_string()
 }
 
 fn sanitize_name(name: &str) -> String {

@@ -19,9 +19,9 @@ pub use config::{
     get_config_value, load_config, save_config, set_config_cache, set_config_value, Config,
 };
 pub use notes::{
-    extract_share_description, format_convert_note, format_part_note, format_raw_note,
-    parse_convert_note, parse_file_note, parse_part_note, ConvertMeta, FileNote, PartMeta,
-    NOTE_VERSION,
+    clean_share_desc, extract_share_description, format_convert_note, format_part_note,
+    format_raw_note, parse_convert_note, parse_file_note, parse_part_note, ConvertMeta,
+    FileNote, PartMeta, NOTE_VERSION,
 };
 /// Crate / CLI version (from Cargo.toml).
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -334,7 +334,7 @@ impl Client {
             normal: links.normal.clone(),
             direct: None,
             saved_path: None,
-            description: html_unescape_simple(&desc),
+            description: clean_share_desc(&desc),
             note_kind,
             orig_name,
         };
@@ -1005,15 +1005,6 @@ impl AjaxRiskResp {
     }
 }
 
-fn html_unescape_simple(s: &str) -> String {
-    s.replace("&quot;", "\"")
-        .replace("&#34;", "\"")
-        .replace("&apos;", "'")
-        .replace("&#39;", "'")
-        .replace("&lt;", "<")
-        .replace("&gt;", ">")
-        .replace("&amp;", "&")
-}
 
 fn is_cdn_risk_page(html: &str) -> bool {
     (html.contains("ajax.php") && html.contains("down_r"))

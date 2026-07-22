@@ -3,7 +3,10 @@
 //! ```json
 //! {"v":1,"kind":"raw","name":"a.txt","as":"a.txt","size":12}
 //! {"v":1,"kind":"convert","name":"a.dex","as":"a.dex.zip","mode":"zip","suffix":"zip","size":20}
-//! {"v":1,"kind":"part","id":"...","name":"big.bin","as":"big_part001.zip","index":1,"total":3,"size":1048576,"next":"FILEID2"}
+//! {"v":1,"kind":"part","id":"...","name":"big.bin","as":"big_s001.zip","index":1,"total":3,"size":1048576,"next":"https://.../xxx","npwd":"ab12"}
+//!
+//! `next` is the following part's share URL; `npwd` is its password. Not compatible
+//! with pre-0.4 notes that stored file ids in `next`.
 //! ```
 
 use serde::{Deserialize, Serialize};
@@ -33,9 +36,12 @@ pub struct FileNote {
     pub total: usize,
     #[serde(default, skip_serializing_if = "is_zero_u64")]
     pub size: u64,
-    /// Next part remote file id (kind=part).
+    /// Next part share URL (kind=part).
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub next: String,
+    /// Password for the next part share (kind=part).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub npwd: String,
 }
 
 fn default_v() -> u32 {
@@ -95,7 +101,8 @@ pub fn format_part_note(
     index: usize,
     total: usize,
     size: u64,
-    next_file_id: &str,
+    next_share_url: &str,
+    next_pwd: &str,
 ) -> String {
     serde_json::to_string(&FileNote {
         v: NOTE_VERSION,
@@ -106,7 +113,8 @@ pub fn format_part_note(
         index,
         total,
         size,
-        next: next_file_id.into(),
+        next: next_share_url.into(),
+        npwd: next_pwd.into(),
         ..Default::default()
     })
     .unwrap_or_default()
@@ -122,6 +130,7 @@ pub struct PartMeta {
     pub total: usize,
     pub size: u64,
     pub next: String,
+    pub npwd: String,
 }
 
 /// Parsed convert/raw metadata.
@@ -137,7 +146,7 @@ pub struct ConvertMeta {
 
 /// Parse a v1 JSON note only (after HTML unescape).
 pub fn parse_file_note(desc: &str) -> Option<FileNote> {
-    let desc = html_unescape(desc.trim());
+    let desc = clean_share_desc(desc);
     if desc.is_empty() {
         return None;
     }
@@ -157,7 +166,32 @@ pub fn parse_file_note(desc: &str) -> Option<FileNote> {
     Some(n)
 }
 
+pub fn strip_html_tags(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut in_tag = false;
+    for c in s.chars() {
+        if c == '<' {
+            in_tag = true;
+            continue;
+        }
+        if in_tag {
+            if c == '>' {
+                in_tag = false;
+            }
+            continue;
+        }
+        out.push(c);
+    }
+    out
+}
+
+pub fn clean_share_desc(s: &str) -> String {
+    html_unescape(&strip_html_tags(s.trim()))
+}
+
 fn html_unescape(s: &str) -> String {
+
+
     if !s.contains('&') {
         return s.to_string();
     }
@@ -183,6 +217,7 @@ pub fn parse_part_note(desc: &str) -> Option<PartMeta> {
         total: n.total,
         size: n.size,
         next: n.next,
+        npwd: n.npwd,
     })
 }
 

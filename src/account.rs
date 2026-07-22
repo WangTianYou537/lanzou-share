@@ -861,12 +861,27 @@ impl Account {
         }
 
         eprintln!("[upload] writing part notes ({total})...");
+        // Prefetch share URL+pwd for each part so "next" is a public share link.
+        let mut shares: Vec<(String, String)> = Vec::with_capacity(total);
+        for sp in &staged {
+            if sp.file_id.is_empty() {
+                shares.push((String::new(), String::new()));
+                continue;
+            }
+            match self.get_file_download_info(&sp.file_id) {
+                Ok((u, p)) => shares.push((u, p)),
+                Err(e) => {
+                    eprintln!("[warn] part {} share info: {e}", sp.index);
+                    shares.push((String::new(), String::new()));
+                }
+            }
+        }
         let mut parts = Vec::with_capacity(total);
         for (i, sp) in staged.iter().enumerate() {
-            let next = if i + 1 < staged.len() {
-                staged[i + 1].file_id.as_str()
+            let (next_url, next_pwd) = if i + 1 < staged.len() {
+                (shares[i + 1].0.as_str(), shares[i + 1].1.as_str())
             } else {
-                ""
+                ("", "")
             };
             if !sp.file_id.is_empty() {
                 let note = crate::notes::format_part_note(
@@ -876,7 +891,8 @@ impl Account {
                     sp.index,
                     total,
                     sp.size,
-                    next,
+                    next_url,
+                    next_pwd,
                 );
                 if let Err(e) = self.set_file_describe(&sp.file_id, &note) {
                     eprintln!("[warn] set part note {}: {e}", sp.index);
